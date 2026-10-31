@@ -50,7 +50,7 @@ class ScryptedMqttBridge extends ScryptedDeviceBase implements Settings {
         },
         opusStream: {
             title: 'Opus stream',
-            description: "With audio: a camera that has a Rebroadcast synthetic stream of this name (audio already in Opus, e.g. output prefix `-c:v copy -c:a libopus -application:a lowdelay -frame_duration 20 -ar:a 48000 -ac:a 1 -b:a 32k -muxdelay 0`) gets that one as its Home Assistant stream, so go2rtc passes the audio through instead of transcoding it. Leave the stream out of the prebuffered ones: it runs only while someone watches. Empty: off.",
+            description: "With audio: a camera that has a Rebroadcast synthetic stream of this name (audio already in Opus, e.g. output prefix `-c:v copy -c:a libopus -application:a lowdelay -frame_duration 20 -ar:a 48000 -ac:a 1 -b:a 32k -muxdelay 0`) gets that one as its Home Assistant stream (and one named `<name>-high`, from the highest-resolution stream, as its High resolution stream), so go2rtc passes the audio through instead of transcoding it. Leave the stream out of the prebuffered ones: it runs only while someone watches. Empty: off.",
             defaultValue: 'opus',
             onPut: () => this.refreshAll(),
         },

@@ -75,7 +75,8 @@ async function rebroadcastUrls(d: Dev, options: ResponseMediaStreamOptions[], ho
     const synthetic = syntheticStreamUrl(settings, opus, audio);
     const mainUrl = (synthetic && streamUrlFor(synthetic, host))
         ?? urlOf(main) ?? (urls.length === 1 ? streamUrlFor(String(urls[0].value), host) : undefined);
-    const highUrl = high && high !== main && (high.video?.width ?? 0) > (main?.video?.width ?? 0) ? urlOf(high) : undefined;
+    const highUrl = high && high !== main && (high.video?.width ?? 0) > (main?.video?.width ?? 0)
+        ? (streamUrlFor(syntheticStreamUrl(settings, opus && `${opus}-high`, audio) ?? '', host) ?? urlOf(high)) : undefined;
     return { main: mainUrl, high: highUrl };
 }
 
