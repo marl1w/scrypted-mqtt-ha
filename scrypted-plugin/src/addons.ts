@@ -21,6 +21,8 @@ export interface AddonSink {
     status(source: string, online: boolean): void;
     /** a source sent its first message since the bridge started */
     sourceAdded?(source: string): void;
+    /** an add-on that (re)started asks for a hello */
+    helloWanted?(source: string): void;
 }
 
 interface SourceRecord {
@@ -98,7 +100,10 @@ export class AddonRelay {
             rec.online = true;
             this.sink.status(source, true);
         }
-        if (msg.type === 'alive') return;
+        if (msg.type === 'alive') {
+            if (msg.hello === true) this.sink.helloWanted?.(source);
+            return;
+        }
         const device = msg.device;
         if (!isDevice(device)) throw new Error(`${source}: invalid device`);
         switch (msg.type) {

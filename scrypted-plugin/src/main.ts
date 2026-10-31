@@ -95,6 +95,7 @@ class ScryptedMqttBridge extends ScryptedDeviceBase implements Settings {
             image: (device, source, key, jpeg) => this.send(this.topics?.image(device, source, key), jpeg, true),
             status: (source, online) => this.send(this.topics?.status(source), online ? 'online' : 'offline', true),
             sourceAdded: () => this.helloSoon(),
+            helloWanted: () => this.helloSoon(),
         }, device => this.cameras.has(device), m => this.console.warn(m), Date.now,
             device => !!sdk.systemManager.getSystemState()[device]);
 

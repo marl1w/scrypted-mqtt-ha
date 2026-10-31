@@ -15,6 +15,7 @@ function setup(published = new Set(['42'])) {
         image: (d, s, k, j) => out.push(`image ${d} ${s} ${k} ${j.length}`),
         status: (s, on) => out.push(`status ${s} ${on ? 'online' : 'offline'}`),
         sourceAdded: s => added.push(s),
+        helloWanted: s => added.push(`hello? ${s}`),
     }, d => published.has(d), m => logs.push(m), () => now);
     return { relay, out, logs, added, published, tick: (ms: number) => { now += ms; } };
 }
@@ -252,4 +253,12 @@ test('images published over budget are cleared like kept ones on a dropped key, 
     published.delete('42');
     relay.deviceUnpublished('42');
     assert.equal(cleared(), 32);
+});
+
+test('an alive asking for a hello is passed on, a plain alive is not', () => {
+    const { relay, added } = setup();
+    relay.handle('p1', msg('alive'));
+    relay.handle('p1', msg('alive', { hello: true }));
+    relay.handle('p1', msg('alive', { hello: 'yes' }));
+    assert.deepEqual(added, ['guard', 'hello? guard']);
 });

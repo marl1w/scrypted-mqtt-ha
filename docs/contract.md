@@ -154,7 +154,7 @@ A Scrypted plugin hands its add-on to the bridge over Scrypted's event bus, with
   { v, type: "state",  source, device, key, value }          value: "ON", "OFF", text, or null for unknown
   { v, type: "event",  source, device, key, event_type, attributes }
   { v, type: "image",  source, device, key, jpeg }            jpeg: base64 of the JPEG, or null for no image
-  { v, type: "alive",  source }                              at start and every 30 s
+  { v, type: "alive",  source, hello? }                      at start and every 30 s; hello: true asks for a hello
   ```
 
 - The bridge emits `ScryptedMqttBridge` events on its own plugin device:
@@ -164,7 +164,7 @@ A Scrypted plugin hands its add-on to the bridge over Scrypted's event bus, with
   { v, type: "command", source, device, key, value }         forwarded from set/<key>
   ```
 
-  `platforms` is the list of entity platforms the bridge accepts, `["binary_sensor", "sensor", "switch", "button", "event", "image"]` today. An add-on declares only entities on those platforms; a `hello` without `platforms` comes from a bridge before 0.1.2, which takes every platform but `image`. The bridge says `hello` about 2 s after it starts, and again (within a second, one for any number of them) after the first message of every source it has not heard from in this run, so an add-on that starts or restarts later learns the platforms too. Every add-on receives each `hello` and resends; the bridge publishes only what changed.
+  `platforms` is the list of entity platforms the bridge accepts, `["binary_sensor", "sensor", "switch", "button", "event", "image"]` today. An add-on declares only entities on those platforms; a `hello` without `platforms` comes from a bridge before 0.1.2, which takes every platform but `image`. The bridge says `hello` about 2 s after it starts, and again (within a second, one for any number of them) after the first message of every source it has not heard from in this run, and whenever an add-on's `alive` carries `hello: true`, which it sends on finding the bridge: an add-on that starts or restarts later learns the platforms too. Every add-on receives each `hello` and resends; the bridge publishes only what changed.
 
   An add-on finds the bridge with `systemManager.getDeviceById("@marl1w/scrypted-mqtt")` and listens to that device.
 
