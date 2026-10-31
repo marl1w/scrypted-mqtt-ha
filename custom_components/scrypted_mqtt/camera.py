@@ -10,7 +10,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .contract import BRIDGE_SOURCE, EntitySpec
 from .entity import setup_platform
-from .hub import CAMERA_KEY, ScryptedMqttHub
+from .hub import ScryptedMqttHub
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback) -> None:
@@ -27,22 +27,32 @@ class ScryptedMqttCamera(Camera):
     _attr_supported_features = CameraEntityFeature.STREAM
 
     def __init__(self, hub: ScryptedMqttHub, device: str, source: str, spec: EntitySpec | None) -> None:
-        """Initialize the camera."""
+        """Initialize the camera: the device's main stream, or the extra stream spec names."""
         super().__init__()
         self._hub = hub
         self._device = device
-        self._attr_unique_id = hub.unique_id(device, BRIDGE_SOURCE, CAMERA_KEY)
+        self._stream_key = spec.key if spec else None
+        self._attr_unique_id = hub.camera_unique_id(device, self._stream_key)
         self._attr_device_info = DeviceInfo(identifiers={hub.device_identifier(device)})
+        if spec:
+            self._attr_name = spec.name
 
     @property
     def available(self) -> bool:
         """Return True while the bridge publishes the device."""
         return self._hub.is_available(self._device, BRIDGE_SOURCE)
 
+    def _source(self) -> str | None:
+        spec = self._hub.device_spec(self._device)
+        if spec is None:
+            return None
+        if self._stream_key is None:
+            return spec.stream
+        return next((s.url for s in spec.streams if s.key == self._stream_key), None)
+
     async def stream_source(self) -> str | None:
         """Return Scrypted's rebroadcast of the camera."""
-        spec = self._hub.device_spec(self._device)
-        return spec.stream if spec else None
+        return self._source()
 
     async def async_camera_image(self, width: int | None = None, height: int | None = None) -> bytes | None:
         """Return a snapshot taken by Scrypted."""
@@ -61,12 +71,15 @@ class ScryptedMqttCamera(Camera):
     @callback
     def handle_update(self) -> None:
         """Follow a changed stream URL and write the new availability."""
-        spec = self._hub.device_spec(self._device)
-        if self.stream is not None and spec is not None and spec.stream and self.stream.source != spec.stream:
-            self.stream.update_source(spec.stream)
+        source = self._source()
+        if self.stream is not None and source and self.stream.source != source:
+            self.stream.update_source(source)
         if self.hass is not None:
             self.async_write_ha_state()
 
     @callback
     def update_spec(self, spec: EntitySpec) -> None:
-        """The camera has no declaration of its own."""
+        """An extra stream renamed."""
+        if self._stream_key is not None:
+            self._attr_name = spec.name
+        self.handle_update()

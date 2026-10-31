@@ -19,10 +19,15 @@ ROOT = "scrypted"
 STREAM = "rtsp://127.0.0.1:40000/0123abcd"
 
 
-def bridge_config(name: str = "Front door", entities: list | None = None, stream: str | None = STREAM) -> str:
+HIGH = "rtsp://127.0.0.1:40000/fedcba98"
+
+
+def bridge_config(name: str = "Front door", entities: list | None = None, stream: str | None = STREAM, high: bool = False) -> str:
     device = {"name": name, "model": "Cam 1", "manufacturer": "Example"}
     if stream:
         device["stream"] = stream
+    if high:
+        device["streams"] = [{"key": "high", "name": "High resolution", "url": HIGH}]
     if entities is None:
         entities = [
             {"key": "online", "name": "Online", "platform": "binary_sensor", "device_class": "connectivity", "category": "diagnostic"},
@@ -226,3 +231,16 @@ async def test_snapshot_replies_only_count_for_their_device_and_widths_are_bucke
         fire(hass, f"devices/7/bridge/snapshot/{request['id']}", b"wrong")
         await hass.async_block_till_done()
         assert await task is None
+
+
+async def test_extra_streams_are_cameras_of_their_own(hass: HomeAssistant, setup) -> None:
+    await publish_camera(hass)
+    fire(hass, "devices/42/bridge/config", bridge_config(high=True))
+    await hass.async_block_till_done()
+    high = hass.data["camera"].get_entity("camera.front_door_high_resolution")
+    assert await high.stream_source() == HIGH
+    main = hass.data["camera"].get_entity("camera.front_door")
+    assert await main.stream_source() == STREAM
+    fire(hass, "devices/42/bridge/config", bridge_config())
+    await hass.async_block_till_done()
+    assert er.async_get(hass).async_get("camera.front_door_high_resolution") is None

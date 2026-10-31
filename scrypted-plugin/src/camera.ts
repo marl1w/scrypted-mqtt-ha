@@ -1,5 +1,5 @@
 import sdk, { Battery, BinarySensor, Camera, EventListenerRegister, ResponseMediaStreamOptions, MotionSensor, ObjectDetector, ObjectsDetected, OccupancySensor, OnOff, Online, ScryptedDevice, ScryptedInterface, Settings, VideoCamera } from '@scrypted/sdk';
-import { ConfigPayload, CONTRACT_VERSION, DeviceSpec, encodeState, EntitySpec, eventType, SnapshotRequest, streamUrlFor } from './contract';
+import { ConfigPayload, CONTRACT_VERSION, DeviceSpec, encodeState, EntitySpec, eventType, SnapshotRequest, StreamSpec, streamUrlFor } from './contract';
 
 type Dev = ScryptedDevice & Partial<VideoCamera & Camera & MotionSensor & OccupancySensor & Online & Battery & ObjectDetector & OnOff & BinarySensor & Settings>;
 
@@ -8,6 +8,8 @@ export interface CameraHost {
     /** config takes no key; state and event do */
     publish(kind: 'config' | 'state' | 'event', device: string, payload: string, key?: string): void;
     streamHost(): string;
+    /** false: the rebroadcast without audio (no AAC for WebRTC to stumble on) */
+    streamAudio(): boolean;
     console: Console;
 }
 
@@ -29,6 +31,8 @@ const withTimeout = <T>(p: Promise<T>, ms: number, what: string) => Promise.race
 /** How a child device of the camera appears on the camera's device, or undefined to leave it out. */
 function childEntity(child: Dev, cameraName: string): EntitySpec | undefined {
     const ifs = child.interfaces || [];
+    // a child that is a camera itself (a crop or mirror view) is a device of its own
+    if (ifs.includes(ScryptedInterface.VideoCamera)) return undefined;
     let name = String(child.name || child.id);
     if (cameraName && name.startsWith(cameraName + ' ')) name = name.slice(cameraName.length + 1);
     name = name.slice(0, 64) || `Device ${child.id}`;
@@ -49,16 +53,27 @@ function childState(child: Dev): boolean | undefined {
     return undefined;
 }
 
-/** The RTSP rebroadcast of the stream Scrypted keeps prebuffered (else the only one it offers), as Home Assistant reaches it. */
-async function rebroadcastUrl(d: Dev, options: ResponseMediaStreamOptions[], host: string): Promise<string | undefined> {
-    if (!options.length || !d.interfaces?.includes(ScryptedInterface.Settings)) return undefined;
+/**
+ * The RTSP rebroadcasts Home Assistant plays, as it reaches them: Rebroadcast's default stream (a cropped view where one
+ * is configured, else a prebuffered one), and the highest-resolution stream when that is another one.
+ */
+async function rebroadcastUrls(d: Dev, options: ResponseMediaStreamOptions[], host: string, audio: boolean): Promise<{ main?: string; high?: string }> {
+    if (!options.length || !d.interfaces?.includes(ScryptedInterface.Settings)) return {};
     const settings = await withTimeout(d.getSettings!(), LOOKUP_TIMEOUT_MS, 'settings');
-    const urls = settings.filter(s => s.key === 'prebuffer:rtspRebroadcastUrl' && typeof s.value === 'string');
-    if (!urls.length) return undefined;
-    const prebuffered = options.find(o => o.prebuffer) ?? options.find(o => o.video?.codec === 'h264') ?? options[0];
-    const match = prebuffered && urls.find(s => s.subgroup === `Stream: ${prebuffered.name}`);
-    const chosen = match ?? (urls.length === 1 ? urls[0] : undefined);
-    return chosen ? streamUrlFor(String(chosen.value), host) : undefined;
+    const key = audio ? 'prebuffer:rtspRebroadcastUrl' : 'prebuffer:rtspRebroadcastMutedUrl';
+    const urls = settings.filter(s => s.key === key && typeof s.value === 'string');
+    if (!urls.length) return {};
+    const urlOf = (o?: ResponseMediaStreamOptions) => {
+        const s = o && urls.find(u => u.subgroup === `Stream: ${o.name}`);
+        return s ? streamUrlFor(String(s.value), host) : undefined;
+    };
+    const defaultName = settings.find(s => s.key === 'prebuffer:defaultStream')?.value;
+    const main = options.find(o => o.name === defaultName) ?? options.find(o => o.prebuffer) ?? options.find(o => o.video?.codec === 'h264') ?? options[0];
+    // widest stream; RTSP before RTMP at the same width (its codec is declared)
+    const high = [...options].sort((a, b) => (b.video?.width ?? 0) - (a.video?.width ?? 0) || Number(b.container === 'rtsp') - Number(a.container === 'rtsp'))[0];
+    const mainUrl = urlOf(main) ?? (urls.length === 1 ? streamUrlFor(String(urls[0].value), host) : undefined);
+    const highUrl = high && high !== main && (high.video?.width ?? 0) > (main?.video?.width ?? 0) ? urlOf(high) : undefined;
+    return { main: mainUrl, high: highUrl };
 }
 
 /** One published camera: its config, the states of its entities, its detections, children and snapshots. */
@@ -71,7 +86,7 @@ export class CameraPublisher {
     private snapshot?: Promise<Buffer | undefined>;
     private lastPicture?: { at: number; jpeg: Buffer };
     private lastEvent = new Map<string, number>();
-    private stream?: { key: string; url?: string; at: number };
+    private stream?: { key: string; urls: { main?: string; high?: string }; at: number };
     private running?: Promise<boolean>;
     private dirty = false;
     private stopped = false;
@@ -88,7 +103,7 @@ export class CameraPublisher {
         return Object.keys(state)
             .filter(id => id !== this.id && state[id]?.providerId?.value === this.id)
             .map(id => sdk.systemManager.getDeviceById<Dev>(id))
-            .filter((c): c is Dev => !!c);
+            .filter((c): c is Dev => !!c && !c.interfaces?.includes(ScryptedInterface.VideoCamera));
     }
 
     /**
@@ -137,13 +152,14 @@ export class CameraPublisher {
             if (e) entities.push(e);
         }
 
-        const stream = await this.streamUrl(d);
+        const urls = await this.streamUrls(d);
         if (this.stopped) return false;
         const device: DeviceSpec = { name: String(d.name || this.id).slice(0, 255) };
         if (d.info?.model) device.model = String(d.info.model).slice(0, 255);
         if (d.info?.manufacturer) device.manufacturer = String(d.info.manufacturer).slice(0, 255);
         if (d.info?.firmware) device.sw_version = String(d.info.firmware).slice(0, 255);
-        if (stream) device.stream = stream;
+        if (urls.main) device.stream = urls.main;
+        if (urls.high) device.streams = [{ key: 'high', name: 'High resolution', url: urls.high } satisfies StreamSpec];
         const payload: ConfigPayload = { v: CONTRACT_VERSION, device, entities };
         const json = JSON.stringify(payload);
 
@@ -164,21 +180,22 @@ export class CameraPublisher {
         return true;
     }
 
-    /** The rebroadcast URL, looked up through every mixin's settings only when the stream options changed or it is old. */
-    private async streamUrl(d: Dev): Promise<string | undefined> {
+    /** The rebroadcast URLs, looked up through every mixin's settings only when the stream options changed or they are old. */
+    private async streamUrls(d: Dev): Promise<{ main?: string; high?: string }> {
         try {
             const options = d.interfaces?.includes(ScryptedInterface.VideoCamera)
                 ? await withTimeout(d.getVideoStreamOptions!(), LOOKUP_TIMEOUT_MS, 'stream options')
                 : [];
-            const key = JSON.stringify([this.host.streamHost(), options.map(o => [o.id, o.name, !!o.prebuffer])]);
-            if (this.stream?.key === key && this.stream.url && Date.now() - this.stream.at < STREAM_URL_TTL_MS) return this.stream.url;
-            const url = await rebroadcastUrl(d, options, this.host.streamHost());
-            this.stream = { key, url, at: Date.now() };
-            return url;
+            const audio = this.host.streamAudio();
+            const key = JSON.stringify([this.host.streamHost(), audio, options.map(o => [o.id, o.name, !!o.prebuffer])]);
+            if (this.stream?.key === key && this.stream.urls.main && Date.now() - this.stream.at < STREAM_URL_TTL_MS) return this.stream.urls;
+            const urls = await rebroadcastUrls(d, options, this.host.streamHost(), audio);
+            this.stream = { key, urls, at: Date.now() };
+            return urls;
         }
         catch (e) {
             this.host.console.warn(`${d.name}: no stream URL (${(e as Error).message})`);
-            return this.stream?.url;
+            return this.stream?.urls ?? {};
         }
     }
 

@@ -59,6 +59,18 @@ class EntitySpec:
 
 
 @dataclass(frozen=True)
+class StreamSpec:
+    """A further stream of the device (one more camera entity)."""
+
+    key: str
+    name: str
+    url: str
+
+
+MAX_STREAMS = 4
+
+
+@dataclass(frozen=True)
 class DeviceSpec:
     """The device as the bridge describes it."""
 
@@ -67,6 +79,7 @@ class DeviceSpec:
     manufacturer: str | None = None
     sw_version: str | None = None
     stream: str | None = None
+    streams: tuple[StreamSpec, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -150,6 +163,19 @@ def _parse_stream(value: Any) -> str | None:
     return value
 
 
+def _parse_streams(raw: Any) -> tuple[StreamSpec, ...]:
+    if not isinstance(raw, list):
+        return ()
+    out: dict[str, StreamSpec] = {}
+    for item in raw[:MAX_STREAMS]:
+        if not isinstance(item, dict):
+            continue
+        key, name, url = item.get("key"), _text(item.get("name"), 64), _parse_stream(item.get("url"))
+        if isinstance(key, str) and _KEY_RE.match(key) and name and url and key not in out:
+            out[key] = StreamSpec(key=key, name=name, url=url)
+    return tuple(out.values())
+
+
 def parse_config(payload: bytes, source: str) -> Config:
     """Return the config; invalid entities are left out and listed in errors."""
     try:
@@ -171,6 +197,7 @@ def parse_config(payload: bytes, source: str) -> Config:
             manufacturer=_text(raw.get("manufacturer")),
             sw_version=_text(raw.get("sw_version")),
             stream=_parse_stream(raw.get("stream")),
+            streams=_parse_streams(raw.get("streams")),
         )
     raw_entities = data.get("entities")
     if not isinstance(raw_entities, list):

@@ -44,7 +44,8 @@ The bridge's own status topic is its MQTT last will, so the broker marks it `off
     "name": "Front door",
     "model": "Doorbell 2",
     "manufacturer": "Example",
-    "stream": "rtsp://127.0.0.1:40000/0123456789abcdef"
+    "stream": "rtsp://127.0.0.1:40000/0123456789abcdef",
+    "streams": [{ "key": "high", "name": "High resolution", "url": "rtsp://127.0.0.1:40000/fedcba9876543210" }]
   },
   "entities": [
     { "key": "motion", "name": "Motion", "platform": "binary_sensor", "device_class": "motion" }
@@ -53,7 +54,7 @@ The bridge's own status topic is its MQTT last will, so the broker marks it `off
 ```
 
 - `v`: contract major version. The integration ignores a config with a major it does not know and logs it once.
-- `device`: **only the `bridge` source sends it**, and the integration ignores it from any other source. `stream` is the RTSP URL Home Assistant plays; it may be missing (no live view, snapshots only). Optional: `model`, `manufacturer`, `sw_version`.
+- `device`: **only the `bridge` source sends it**, and the integration ignores it from any other source. `stream` is the RTSP URL Home Assistant plays; it may be missing (no live view, snapshots only). `streams` lists further streams, `{"key", "name", "url"}` each (`key` as in section 2, at most 4), and each becomes one more camera entity on the device (the bridge sends the highest-resolution stream as `high`, "High resolution", when it is not the main one). Optional: `model`, `manufacturer`, `sw_version`, `streams`.
 - `entities`: the full list this source provides for this device, at most 64. A new config replaces the previous list: entities missing from it are removed.
 - An empty retained payload withdraws the config: the source's entities on that device are removed, and if the source is `bridge`, the device with everything on it.
 
@@ -116,15 +117,15 @@ The integration publishes `{"id": "<request id>", "width": 640}` to `bridge/snap
 ## 9. Home Assistant mapping
 
 - Device identifier: `("scrypted_mqtt", "<root>:<device>")`.
-- Camera entity: unique id `<root>:<device>:camera`, named after the device. Plays `device.stream` (Home Assistant's go2rtc gives live view over WebRTC) and takes snapshots through section 7.
+- Camera entity: unique id `<root>:<device>:camera`, named after the device; one more per extra stream, unique id `<root>:<device>:camera:<key>`, named by the stream's `name`. Plays `device.stream` (Home Assistant's go2rtc gives live view over WebRTC) and takes snapshots through section 7.
 - Other entities: unique id `<root>:<device>:<source>:<key>`.
 - The integration subscribes to `<root>/#` through Home Assistant's MQTT integration and needs no setting other than `root`.
 
 ## 10. Bridge
 
-Settings: broker URL, user, password, `root`, the cameras to publish (none by default), and the host Home Assistant uses to reach Scrypted's rebroadcast (default `127.0.0.1`, for a Scrypted that shares the host network with Home Assistant).
+Settings: broker URL, user, password, `root`, the cameras to publish (none by default), the host Home Assistant uses to reach Scrypted's rebroadcast (default `127.0.0.1`, for a Scrypted that shares the host network with Home Assistant), and whether the stream carries audio (default off: the muted rebroadcast, which WebRTC plays without transcoding the camera's AAC audio).
 
-The stream is the Rebroadcast plugin's RTSP URL of the camera's prebuffered stream (the one Scrypted already keeps open), so live view adds no connection to the camera.
+The stream is the Rebroadcast plugin's RTSP URL of the camera's default stream (as set in Rebroadcast, so a cropped view where one is configured; otherwise a prebuffered stream), which Scrypted already keeps open, so live view adds no connection to the camera.
 
 Base entities, each present only when the camera has the matching Scrypted interface:
 
@@ -136,7 +137,7 @@ Base entities, each present only when the camera has the matching Scrypted inter
 | `detection` | event | `ObjectDetector`. One event per distinct class in each detection payload, `motion` skipped, `event_type` = class name, attributes `label`, `score` (two decimals) and `zones`. At most one event per class every 5 s: a class that stays in view keeps firing at that pace. |
 | `battery` | sensor `battery`, `%`, diagnostic | `Battery` |
 
-Each child device of the camera (its `providerId` is the camera) becomes entities on the camera's device, keyed `child_<child id>`, named after the child without the camera's name: `OnOff` as a switch, else `OccupancySensor`, `MotionSensor` or `BinarySensor` as a binary sensor.
+Each child device of the camera (its `providerId` is the camera) that is not a camera itself becomes entities on the camera's device, keyed `child_<child id>`, named after the child without the camera's name: `OnOff` as a switch, else `OccupancySensor`, `MotionSensor` or `BinarySensor` as a binary sensor.
 
 ### Add-ons inside Scrypted
 

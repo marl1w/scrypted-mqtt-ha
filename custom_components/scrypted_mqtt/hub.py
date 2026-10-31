@@ -85,6 +85,11 @@ class ScryptedMqttHub:
             return f"{self.root}:{device}:{CAMERA_KEY}"
         return f"{self.root}:{device}:{source}:{key}"
 
+    def camera_unique_id(self, device: str, stream: str | None) -> str:
+        """Return the unique id of the device's camera, or of one of its extra streams."""
+        base = self.unique_id(device, BRIDGE_SOURCE, CAMERA_KEY)
+        return f"{base}:{stream}" if stream else base
+
     def device_identifier(self, device: str) -> tuple[str, str]:
         """Return the device registry identifier of a Scrypted device."""
         return (DOMAIN, f"{self.root}:{device}")
@@ -95,6 +100,8 @@ class ScryptedMqttHub:
         parts = unique_id[len(self.root) + 1 :].split(":")
         if len(parts) == 2 and parts[1] == CAMERA_KEY:
             return parts[0], BRIDGE_SOURCE, CAMERA_KEY
+        if len(parts) == 3 and parts[1] == CAMERA_KEY:
+            return parts[0], BRIDGE_SOURCE, f"{CAMERA_KEY}:{parts[2]}"
         if len(parts) == 3:
             return parts[0], parts[1], parts[2]
         return None
@@ -270,8 +277,9 @@ class ScryptedMqttHub:
             manufacturer=spec.manufacturer,
             sw_version=spec.sw_version,
         )
-        if entity := self._entities.get(self.unique_id(device, BRIDGE_SOURCE, CAMERA_KEY)):
-            entity.handle_update()
+        for uid, (platform, dev, _, _) in self._created.items():
+            if dev == device and platform == CAMERA_PLATFORM and (entity := self._entities.get(uid)):
+                entity.handle_update()
 
     def _desired(self, device: str) -> dict[str, tuple[str, str, EntitySpec | None]]:
         bridge = self._bridge.get(device)
@@ -280,6 +288,13 @@ class ScryptedMqttHub:
         desired: dict[str, tuple[str, str, EntitySpec | None]] = {
             self.unique_id(device, BRIDGE_SOURCE, CAMERA_KEY): (CAMERA_PLATFORM, BRIDGE_SOURCE, None)
         }
+        for stream in bridge.device.streams if bridge.device else ():
+            # an extra camera: its spec carries the stream key and name
+            desired[self.camera_unique_id(device, stream.key)] = (
+                CAMERA_PLATFORM,
+                BRIDGE_SOURCE,
+                EntitySpec(key=stream.key, name=stream.name, platform=CAMERA_PLATFORM),
+            )
         configs = [(BRIDGE_SOURCE, bridge), *self._sources.get(device, {}).items()]
         for source, config in configs:
             for spec in config.entities:

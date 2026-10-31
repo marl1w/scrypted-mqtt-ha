@@ -49,12 +49,20 @@ export interface EntitySpec {
     object_id?: string;
 }
 
+export interface StreamSpec {
+    key: string;
+    name: string;
+    url: string;
+}
+
 export interface DeviceSpec {
     name: string;
     model?: string;
     manufacturer?: string;
     sw_version?: string;
     stream?: string;
+    /** further streams, one more camera entity each (e.g. the high-resolution one) */
+    streams?: StreamSpec[];
 }
 
 export interface ConfigPayload {

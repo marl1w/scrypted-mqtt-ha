@@ -39,6 +39,13 @@ class ScryptedMqttBridge extends ScryptedDeviceBase implements Settings {
             defaultValue: '127.0.0.1',
             onPut: () => this.restartSoon(),
         },
+        streamAudio: {
+            title: 'Stream audio',
+            description: "Off: Home Assistant gets Scrypted's rebroadcast without audio, so WebRTC live view never stalls on the camera's AAC audio.",
+            type: 'boolean',
+            defaultValue: false,
+            onPut: () => this.refreshAll(),
+        },
         cameras: {
             title: 'Cameras',
             description: 'Cameras published to MQTT.',
@@ -325,6 +332,7 @@ class ScryptedMqttBridge extends ScryptedDeviceBase implements Settings {
                     else this.send(topics.event(device, BRIDGE_SOURCE, key!), payload, false);
                 },
                 streamHost: () => String(this.storageSettings.values.streamHost || '127.0.0.1'),
+                streamAudio: () => !!this.storageSettings.values.streamAudio,
                 console: this.console,
             });
             this.cameras.set(id, c);
