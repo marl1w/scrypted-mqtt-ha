@@ -1,0 +1,57 @@
+{
+  "name": "@marl1w/scrypted-mqtt",
+  "version": "0.1.0",
+  "description": "Scrypted plugin that publishes cameras, their sensors, controls and snapshots, and other plugins' add-ons, to MQTT for the Scrypted MQTT Home Assistant integration.",
+  "license": "MIT",
+  "scripts": {
+    "scrypted-setup-project": "scrypted-setup-project",
+    "prescrypted-setup-project": "scrypted-package-json",
+    "build": "scrypted-webpack",
+    "prepublishOnly": "NODE_ENV=production scrypted-webpack",
+    "scrypted-deploy": "scrypted-deploy",
+    "scrypted-deploy-debug": "scrypted-deploy-debug",
+    "scrypted-debug": "scrypted-debug",
+    "scrypted-package-json": "scrypted-package-json",
+    "typecheck": "tsc --noEmit",
+    "test": "tsc -p tsconfig.test.json && node --test out-test/test/*.test.js"
+  },
+  "keywords": [
+    "scrypted",
+    "plugin",
+    "mqtt",
+    "home-assistant"
+  ],
+  "scrypted": {
+    "rollup": true,
+    "name": "Scrypted MQTT",
+    "type": "API",
+    "interfaces": [
+      "Settings"
+    ],
+    "pluginDependencies": []
+  },
+  "dependencies": {
+    "@scrypted/sdk": "^0.5.59",
+    "mqtt": "5.16.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.0",
+    "typescript": "^5.6.0"
+  },
+  "author": "marl1w",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/marl1w/scrypted-mqtt-ha.git"
+  },
+  "homepage": "https://github.com/marl1w/scrypted-mqtt-ha#readme",
+  "bugs": {
+    "url": "https://github.com/marl1w/scrypted-mqtt-ha/issues"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "README.md",
+    "package.json"
+  ]
+}

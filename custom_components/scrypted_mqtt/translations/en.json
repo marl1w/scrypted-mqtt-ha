@@ -1,0 +1,17 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Scrypted MQTT",
+        "description": "Cameras published by the Scrypted MQTT plugin, through Home Assistant's MQTT broker connection.",
+        "data": { "root": "Topic root" },
+        "data_description": { "root": "The topic root set in the Scrypted MQTT plugin." }
+      }
+    },
+    "error": { "invalid_root": "Letters, digits, - and _ separated by /, without wildcards." },
+    "abort": {
+      "mqtt_not_configured": "Set up the MQTT integration first.",
+      "single_instance_allowed": "Scrypted MQTT is already set up."
+    }
+  }
+}

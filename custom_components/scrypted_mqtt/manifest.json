@@ -1,0 +1,14 @@
+{
+  "domain": "scrypted_mqtt",
+  "name": "Scrypted MQTT",
+  "codeowners": ["@marl1w"],
+  "config_flow": true,
+  "dependencies": ["mqtt"],
+  "documentation": "https://github.com/marl1w/scrypted-mqtt-ha",
+  "integration_type": "hub",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/marl1w/scrypted-mqtt-ha/issues",
+  "requirements": [],
+  "single_config_entry": true,
+  "version": "0.1.0"
+}
