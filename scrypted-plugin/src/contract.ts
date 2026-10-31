@@ -4,6 +4,8 @@
  */
 
 export const CONTRACT_VERSION = 1;
+/** The oldest integration that understands everything the bridge's configs carry (`replaces`). */
+export const MIN_INTEGRATION = '0.2.0';
 export const BRIDGE_SOURCE = 'bridge';
 /** Scrypted event interface an add-on emits on its own plugin device. */
 export const ADDON_EVENT = 'ScryptedMqttAddon';
@@ -54,6 +56,8 @@ export interface EntitySpec {
     enabled?: boolean;
     icon?: string;
     object_id?: string;
+    /** bridge only: add-on entities (`<source>:<key>`) this one takes over (section 9) */
+    replaces?: string[];
 }
 
 export interface StreamSpec {
@@ -74,6 +78,8 @@ export interface DeviceSpec {
 
 export interface ConfigPayload {
     v: number;
+    /** bridge only: the oldest integration version that handles this config fully */
+    min_integration?: string;
     device?: DeviceSpec;
     entities: EntitySpec[];
 }

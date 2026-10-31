@@ -23,6 +23,8 @@ export interface AddonSink {
     sourceAdded?(source: string): void;
     /** an add-on that (re)started asks for a hello */
     helloWanted?(source: string): void;
+    /** a source's config for the device changed or was withdrawn (not called when it is only sent again) */
+    configChanged?(device: string): void;
 }
 
 interface SourceRecord {
@@ -78,6 +80,16 @@ export class AddonRelay {
         return this.sources.has(source);
     }
 
+    /** Every source's current config for the device, with the Scrypted id of the plugin device that sent it. */
+    configsFor(device: string): { source: string; owner: string; entities: EntitySpec[] }[] {
+        const out: { source: string; owner: string; entities: EntitySpec[] }[] = [];
+        for (const [source, rec] of this.sources) {
+            const entities = rec.configs.get(device);
+            if (entities) out.push({ source, owner: rec.owner, entities });
+        }
+        return out;
+    }
+
     /** True when the source's current config for the device declares `key` as an image entity. */
     declaresImage(device: string, source: string, key: string): boolean {
         return !!this.sources.get(source)?.configs.get(device)?.some(e => e.key === key && e.platform === 'image');
@@ -125,6 +137,7 @@ export class AddonRelay {
         const before = rec.configs.get(device);
         if (before && JSON.stringify(before) === JSON.stringify(entities)) return;
         rec.configs.set(device, entities);
+        this.sink.configChanged?.(device);
         const keys = new Set(entities.map(e => e.key));
         const states = rec.states.get(device);
         const published = this.isPublished(device);
@@ -144,6 +157,7 @@ export class AddonRelay {
     private withdraw(rec: SourceRecord, source: string, device: string) {
         if (!rec.configs.has(device)) return;
         rec.configs.delete(device);
+        this.sink.configChanged?.(device);
         rec.states.delete(device);
         const published = this.isPublished(device);
         // images are large: cleared from the broker at once, not left retained until a later run finds them stale

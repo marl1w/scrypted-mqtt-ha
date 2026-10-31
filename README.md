@@ -11,9 +11,20 @@ One Home Assistant device per Scrypted camera, with everything Scrypted knows ab
 ## What each camera gets
 
 - **Camera**: live view from Scrypted's rebroadcast (WebRTC through Home Assistant's go2rtc), snapshots taken by Scrypted.
-- **Sensors** from the camera's Scrypted interfaces: online, motion, occupancy, battery, and an **Object detected** event per detection class.
-- **Child devices** of the camera (siren, floodlight, extra sensors) as switches and binary sensors on the same device.
-- **Add-ons**: any Scrypted plugin can add entities to a camera (contract section 10), pictures included (an image entity, such as the last verified detection). States are exact: on and off as the plugin reports them, with no timers.
+- **Sensors** from the camera's Scrypted interfaces: online, motion, occupancy, sound, battery, and an **Object detected** event per detection class.
+- **Devices that belong to the camera**: its children (siren, floodlight, day/night) and its mixins' sensors named after it (presence, tamper), as switches and binary sensors on the same device, read from their standard Scrypted interfaces.
+- **Raw signals**: the camera's own motion and AI classes as `Camera motion`, `Camera person`, … next to the verified ones: from the camera plugin's `Camera <signal>` child sensors where it has them, else (classes only) from the camera's own detection events, leaving out those of its mixins.
+- **Add-ons**: for what no standard interface carries, any Scrypted plugin can add entities to a camera (contract section 10), pictures included (an image entity, such as the last verified detection). States are exact: on and off as the plugin reports them, with no timers.
+
+## Upgrading to 0.2.0
+
+The bridge now reads what other plugins expose through standard interfaces, and its entities take over the add-on entities they duplicate, keeping their entity ids and history. Upgrade in this order:
+
+1. the **integration** (HACS), and restart Home Assistant;
+2. the **bridge** (Scrypted plugin);
+3. once the entities show `bridge` unique ids in Home Assistant, the **add-ons** may stop publishing what the bridge now reads.
+
+**Rolling back.** Roll back the bridge first and keep integration 0.2.0: it hands every entry back to the add-on entity it came from (same entity id, history and customisations). Then roll back the integration if you must. An integration older than 0.2.0 does not know about hand-overs: with a 0.2.0 bridge it shows the add-on entities again beside the bridge's, under new `_2` entity ids, until the integration is 0.2.0 again, which removes those copies (their history stays under the `_2` ids).
 
 ## Install
 

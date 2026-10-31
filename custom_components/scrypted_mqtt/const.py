@@ -3,6 +3,8 @@
 from homeassistant.const import Platform
 
 DOMAIN = "scrypted_mqtt"
+# This integration's version (manifest.json); a bridge config may ask for at least this much.
+VERSION = "0.2.0"
 CONF_ROOT = "root"
 DEFAULT_ROOT = "scrypted"
 

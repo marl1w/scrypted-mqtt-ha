@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
 import re
 from typing import Any
@@ -28,6 +28,8 @@ _ROOT_RE = re.compile(r"^[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*$")
 _DEVICE_CLASS_RE = re.compile(r"^[a-z_]{1,32}$")
 _ICON_RE = re.compile(r"^mdi:[a-z0-9-]{1,64}$")
 _STATE_CLASSES = ("measurement", "total", "total_increasing")
+_VERSION_RE = re.compile(r"^\d{1,4}(\.\d{1,4}){0,3}$")
+MAX_REPLACES = 8
 _CATEGORIES = ("diagnostic", "config")
 
 
@@ -65,6 +67,8 @@ class EntitySpec:
     enabled: bool = True
     icon: str | None = None
     object_id: str | None = None
+    # bridge only: add-on entities, as (source, key), this one takes over (section 9)
+    replaces: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -98,6 +102,8 @@ class Config:
     device: DeviceSpec | None
     entities: tuple[EntitySpec, ...]
     errors: tuple[str, ...] = field(default=(), compare=False)
+    # bridge only: the oldest integration version that handles this config fully
+    min_integration: str | None = None
 
 
 def _text(value: Any, limit: int = 255) -> str | None:
@@ -157,7 +163,21 @@ def parse_entity(raw: Any) -> EntitySpec:
         if not isinstance(object_id, str) or not _OBJECT_ID_RE.match(object_id):
             raise ContractError(f"{key}: invalid object_id")
         values["object_id"] = object_id
+    if (replaces := raw.get("replaces")) is not None:
+        values["replaces"] = _parse_replaces(key, replaces)
     return EntitySpec(key=key, name=name, platform=platform, **values)
+
+
+def _parse_replaces(key: str, raw: Any) -> tuple[tuple[str, str], ...]:
+    if not isinstance(raw, list) or len(raw) > MAX_REPLACES:
+        raise ContractError(f"{key}: invalid replaces")
+    out: dict[tuple[str, str], None] = {}
+    for item in raw:
+        source, _, target = item.partition(":") if isinstance(item, str) else ("", "", "")
+        if not is_source(source) or not _KEY_RE.match(target):
+            raise ContractError(f"{key}: invalid replaces")
+        out[(source, target)] = None
+    return tuple(out)
 
 
 def _parse_stream(value: Any) -> str | None:
@@ -227,7 +247,28 @@ def parse_config(payload: bytes, source: str) -> Config:
         entities.append(spec)
     if len(raw_entities) > MAX_ENTITIES:
         errors.append(f"more than {MAX_ENTITIES} entities, the rest ignored")
-    return Config(device=device, entities=tuple(entities), errors=tuple(errors))
+    min_integration = None
+    if source == BRIDGE_SOURCE:
+        entities = _without_replace_cycles(entities)
+        if isinstance(m := data.get("min_integration"), str) and _VERSION_RE.match(m):
+            min_integration = m
+    return Config(device=device, entities=tuple(entities), errors=tuple(errors), min_integration=min_integration)
+
+
+def _without_replace_cycles(entities: list[EntitySpec]) -> list[EntitySpec]:
+    """Drop replaces of an entity's own key, and of a bridge key that itself replaces something (no chains, no cycles)."""
+    replacing = {e.key for e in entities if e.replaces}
+    out = []
+    for e in entities:
+        kept = tuple(r for r in e.replaces if r[0] != BRIDGE_SOURCE or (r[1] != e.key and r[1] not in replacing))
+        out.append(e if kept == e.replaces else replace(e, replaces=kept))
+    return out
+
+
+def version_tuple(version: str) -> tuple[int, ...]:
+    """Return a dotted version as four numbers for comparing (missing or non-numeric parts count as 0)."""
+    parts = [int(p) if p.isdigit() else 0 for p in version.split(".")][:4]
+    return tuple(parts + [0] * (4 - len(parts)))
 
 
 def parse_event(payload: bytes) -> tuple[str, dict[str, Any]]:

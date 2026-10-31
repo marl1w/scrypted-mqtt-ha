@@ -3,9 +3,10 @@ import { StorageSettings } from '@scrypted/sdk/storage-settings';
 import mqtt, { IClientOptions, MqttClient } from 'mqtt';
 import packageJson from '../package.json';
 import { AddonRelay } from './addons';
-import { CameraPublisher } from './camera';
+import { allFacts, CameraPublisher } from './camera';
 import { ADDON_EVENT, BRIDGE_EVENT, BRIDGE_SOURCE, CONTRACT_VERSION, EntitySpec, helloMessage, isRoot, parseSnapshotRequest, Topics } from './contract';
 import { RetainedLedger, staleOwned } from './retained';
+import { camerasOf, CameraMemory, ForgetLater } from './fold';
 
 /** Every camera's config is rebuilt this often (stream URL, children, object types). */
 const REFRESH_MS = 10 * 60_000;
@@ -19,6 +20,11 @@ const HELLO_DELAY_MS = 2000;
 const HELLO_DEBOUNCE_MS = 1000;
 const SWEEP_MS = 15_000;
 const LEDGER_KEY = 'retainedTopics';
+const MEMORY_KEY = 'cameraMemory';
+/** A camera waits at most this long for a burst of changes to settle. */
+const REFRESH_MAX_WAIT_MS = 15_000;
+/** Cameras starting together begin this far apart. */
+const STARTUP_STAGGER_MS = 200;
 
 class ScryptedMqttBridge extends ScryptedDeviceBase implements Settings {
     storageSettings = new StorageSettings(this, {
@@ -85,8 +91,13 @@ class ScryptedMqttBridge extends ScryptedDeviceBase implements Settings {
     private lastError = '';
     private addonListeners = new Map<string, EventListenerRegister>();
     private refreshTimers = new Map<string, NodeJS.Timeout>();
+    /** when each camera's pending refresh was first asked for */
+    private refreshAsked = new Map<string, number>();
     private helloSent = false;
     private helloTimer?: NodeJS.Timeout;
+    /** what is remembered of each published camera across restarts (fold.ts, CameraMemory) */
+    private memory: Record<string, CameraMemory> = {};
+    private forgetting = new ForgetLater();
 
     constructor(nativeId?: string) {
         super(nativeId);
@@ -94,8 +105,15 @@ class ScryptedMqttBridge extends ScryptedDeviceBase implements Settings {
         let previous: string[] = [];
         try { previous = JSON.parse(this.storage.getItem(LEDGER_KEY) || '[]'); } catch { /* start clean */ }
         this.ledger = new RetainedLedger(Array.isArray(previous) ? previous.filter(t => typeof t === 'string') : []);
+        try {
+            const m = JSON.parse(this.storage.getItem(MEMORY_KEY) || '{}');
+            if (m && typeof m === 'object' && !Array.isArray(m)) this.memory = m;
+        }
+        catch { /* start clean */ }
         this.relay = new AddonRelay({
             config: (device, source, entities) => this.publishConfig(device, source, entities),
+            // the camera's entities may take over some of the add-on's (contract section 9)
+            configChanged: device => this.refreshSoon(device),
             state: (device, source, key, payload) => this.send(this.topics?.state(device, source, key), payload, true),
             event: (device, source, key, payload) => this.send(this.topics?.event(device, source, key), payload, false),
             image: (device, source, key, jpeg) => this.send(this.topics?.image(device, source, key), jpeg, true),
@@ -339,6 +357,7 @@ class ScryptedMqttBridge extends ScryptedDeviceBase implements Settings {
             c.stop(true);
             this.cameras.delete(id);
             this.relay.deviceUnpublished(id);
+            this.unpublished(id);
         }).catch(e => this.console.warn(`camera ${id}: ${(e as Error).message}`));
     }
 
@@ -346,12 +365,16 @@ class ScryptedMqttBridge extends ScryptedDeviceBase implements Settings {
     private syncCameras() {
         if (!this.topics) return;
         const want = new Set(this.selected());
+        for (const id of this.forgetting.sweep(id => want.has(id))) this.forget(id);
         for (const [id, c] of this.cameras) {
             if (want.has(id)) continue;
             c.stop(true);
             this.cameras.delete(id);
             this.relay.deviceUnpublished(id);
+            this.unpublished(id);
         }
+        // new cameras a little apart, not all at once at startup
+        let started = 0;
         for (const id of want) {
             if (this.cameras.has(id)) continue;
             const c = new CameraPublisher(id, {
@@ -364,13 +387,24 @@ class ScryptedMqttBridge extends ScryptedDeviceBase implements Settings {
                 streamHost: () => String(this.storageSettings.values.streamHost || '127.0.0.1'),
                 streamAudio: () => !!this.storageSettings.values.streamAudio,
                 opusStream: () => String(this.storageSettings.values.opusStream ?? '').trim(),
+                addons: (device, state) => this.relay.configsFor(device)
+                    .map(c => ({ source: c.source, pluginId: state[c.owner]?.pluginId?.value as string | undefined, entities: c.entities })),
+                memory: device => this.memory[device] ?? {},
+                remember: (device, memory) => {
+                    this.memory[device] = memory;
+                    this.persistMemory();
+                },
+                foldedElsewhere: (device, id) => [...this.cameras].some(([cid, c]) => cid !== device && c.folds(id)),
                 console: this.console,
             });
             this.cameras.set(id, c);
-            c.refresh().then(present => {
-                if (present && this.cameras.get(id) === c) this.relay.devicePublished(id);
-                else if (!present) this.refreshCamera(id);
-            }).catch(e => this.console.warn(`camera ${id}: ${(e as Error).message}`));
+            setTimeout(() => {
+                if (this.cameras.get(id) !== c) return;
+                c.refresh().then(present => {
+                    if (present && this.cameras.get(id) === c) this.relay.devicePublished(id);
+                    else if (!present) this.refreshCamera(id);
+                }).catch(e => this.console.warn(`camera ${id}: ${(e as Error).message}`));
+            }, STARTUP_STAGGER_MS * started++);
         }
     }
 
@@ -391,18 +425,51 @@ class ScryptedMqttBridge extends ScryptedDeviceBase implements Settings {
             return;
         }
         const camera = this.cameras.has(id) ? id : provider && this.cameras.has(provider) ? provider : undefined;
-        if (camera) {
-            clearTimeout(this.refreshTimers.get(camera));
-            this.refreshTimers.set(camera, setTimeout(() => {
-                this.refreshTimers.delete(camera);
-                this.refreshCamera(camera);
-            }, DESCRIPTOR_DEBOUNCE_MS));
-        }
+        if (camera) this.refreshSoon(camera);
         else if (this.selected().includes(id)) this.syncCameras();
+        else if (provider) {
+            // a device of a plugin may be a companion of a camera (fold.ts): the cameras it is folded into, now or before
+            const now = camerasOf(id, allFacts(state));
+            for (const [c, p] of this.cameras) if (now.includes(c) || p.folds(id)) this.refreshSoon(c);
+        }
+    }
+
+    /** One camera, once a burst of changes has settled. */
+    private refreshSoon(camera: string) {
+        if (!this.cameras.has(camera)) return;
+        const now = Date.now();
+        const asked = this.refreshAsked.get(camera) ?? now;
+        this.refreshAsked.set(camera, asked);
+        clearTimeout(this.refreshTimers.get(camera));
+        // debounced, but never put off for more than REFRESH_MAX_WAIT_MS by a steady stream of changes
+        this.refreshTimers.set(camera, setTimeout(() => {
+            this.refreshTimers.delete(camera);
+            this.refreshAsked.delete(camera);
+            this.refreshCamera(camera);
+        }, Math.max(0, Math.min(DESCRIPTOR_DEBOUNCE_MS, asked + REFRESH_MAX_WAIT_MS - now))));
+    }
+
+    private persistMemory() {
+        this.storage.setItem(MEMORY_KEY, JSON.stringify(this.memory));
+    }
+
+    /** A camera is no longer published: what was remembered of it goes too. */
+    /** A camera stopped being published: forget it at once when it is gone or deselected, else at the next pass. */
+    private unpublished(id: string) {
+        const listed = (this.storageSettings.values.cameras as unknown[] | undefined ?? []).map(String).includes(id);
+        if (this.forgetting.unpublished(id, !sdk.systemManager.getSystemState()[id] || !listed)) this.forget(id);
+    }
+
+    private forget(id: string) {
+        if (!(id in this.memory)) return;
+        delete this.memory[id];
+        this.persistMemory();
     }
 
     /** Every camera, a few seconds apart; also retries clearing stale add-on topics. */
     private refreshAll() {
+        const selected = new Set(this.selected());
+        for (const id of this.forgetting.sweep(id => selected.has(id))) this.forget(id);
         [...this.cameras.keys()].forEach((id, i) => setTimeout(() => this.refreshCamera(id), i * 2000));
         this.clearStale();
     }

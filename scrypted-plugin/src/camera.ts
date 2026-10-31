@@ -1,8 +1,9 @@
-import sdk, { Battery, BinarySensor, Camera, EventListenerRegister, ResponseMediaStreamOptions, MotionSensor, ObjectDetector, ObjectsDetected, OccupancySensor, OnOff, Online, ScryptedDevice, ScryptedInterface, Settings, VideoCamera } from '@scrypted/sdk';
-import { ConfigPayload, CONTRACT_VERSION, DeviceSpec, encodeState, EntitySpec, eventType, SnapshotRequest, StreamSpec, streamUrlFor } from './contract';
+import sdk, { AudioSensor, Battery, BinarySensor, Camera, EventListenerRegister, ResponseMediaStreamOptions, MotionSensor, ObjectDetector, ObjectsDetected, OccupancySensor, OnOff, Online, ScryptedDevice, ScryptedInterface, Settings, VideoCamera } from '@scrypted/sdk';
+import { ConfigPayload, CONTRACT_VERSION, DeviceSpec, encodeState, EntitySpec, eventType, MIN_INTEGRATION, SnapshotRequest, StreamSpec, streamUrlFor } from './contract';
+import { AddonEntities, CameraMemory, CHILD_PREFIX, DeviceFacts, FOLDED_PROPERTY, foldedDevices, foldedEntity, foldedInterface, isCameraDetection, MAX_RAW_CLASSES, mergeReplaces, RAW_PREFIX, RawClasses, rawBesideFolded, rawEntities, replacesFor, stableFolded } from './fold';
 import { StreamUrlKeeper, StreamUrls, syntheticStreamUrl } from './stream';
 
-type Dev = ScryptedDevice & Partial<VideoCamera & Camera & MotionSensor & OccupancySensor & Online & Battery & ObjectDetector & OnOff & BinarySensor & Settings>;
+type Dev = ScryptedDevice & Partial<VideoCamera & Camera & MotionSensor & OccupancySensor & AudioSensor & Online & Battery & ObjectDetector & OnOff & BinarySensor & Settings>;
 
 /** What a camera publisher needs from the bridge. */
 export interface CameraHost {
@@ -13,6 +14,13 @@ export interface CameraHost {
     streamAudio(): boolean;
     /** name of a Rebroadcast synthetic stream that, where a camera has it, Home Assistant plays instead (empty: none) */
     opusStream(): string;
+    /** the add-ons' entities on this camera, with the plugin that sent each */
+    addons(device: string, state: SystemState): AddonEntities[];
+    /** what the bridge remembers of this camera across restarts */
+    memory(device: string): CameraMemory;
+    remember(device: string, memory: CameraMemory): void;
+    /** true when another published camera folds this device now */
+    foldedElsewhere(device: string, id: string): boolean;
     console: Console;
 }
 
@@ -22,36 +30,30 @@ const SNAPSHOT_REUSE_MS = 3000;
 /** One event per class per camera at most this often: detectors repeat every second while a class is seen. */
 const DETECTION_EVENT_MS = 5000;
 const LOOKUP_TIMEOUT_MS = 15000;
-const CHILD_PREFIX = 'child_';
 
 const withTimeout = <T>(p: Promise<T>, ms: number, what: string) => Promise.race([
     p,
     new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`${what}: timeout`)), ms).unref?.()),
 ]);
 
-/** How a child device of the camera appears on the camera's device, or undefined to leave it out. */
-function childEntity(child: Dev, cameraName: string): EntitySpec | undefined {
-    const ifs = child.interfaces || [];
-    // a child that is a camera itself (a crop or mirror view) is a device of its own
-    if (ifs.includes(ScryptedInterface.VideoCamera)) return undefined;
-    let name = String(child.name || child.id);
-    if (cameraName && name.startsWith(cameraName + ' ')) name = name.slice(cameraName.length + 1);
-    name = name.slice(0, 64) || `Device ${child.id}`;
-    const key = `${CHILD_PREFIX}${child.id}`;
-    if (ifs.includes(ScryptedInterface.OnOff)) return { key, name, platform: 'switch' };
-    if (ifs.includes(ScryptedInterface.OccupancySensor)) return { key, name, platform: 'binary_sensor', device_class: 'occupancy' };
-    if (ifs.includes(ScryptedInterface.MotionSensor)) return { key, name, platform: 'binary_sensor', device_class: 'motion' };
-    if (ifs.includes(ScryptedInterface.BinarySensor)) return { key, name, platform: 'binary_sensor' };
-    return undefined;
+export type SystemState = ReturnType<typeof sdk.systemManager.getSystemState>;
+
+export function factsOf(id: string, s: any): DeviceFacts {
+    return {
+        id,
+        name: s?.name?.value,
+        pluginId: s?.pluginId?.value,
+        providerId: s?.providerId?.value,
+        interfaces: s?.interfaces?.value,
+        mixins: (s?.mixins?.value as unknown[] | undefined)?.map(String),
+    };
 }
 
-function childState(child: Dev): boolean | undefined {
-    const ifs = child.interfaces || [];
-    if (ifs.includes(ScryptedInterface.OnOff)) return child.on;
-    if (ifs.includes(ScryptedInterface.OccupancySensor)) return child.occupied;
-    if (ifs.includes(ScryptedInterface.MotionSensor)) return child.motionDetected;
-    if (ifs.includes(ScryptedInterface.BinarySensor)) return child.binaryState;
-    return undefined;
+export const allFacts = (state: SystemState) => Object.keys(state).map(id => factsOf(id, state[id]));
+
+function foldedState(dev: Dev): unknown {
+    const iface = foldedInterface(dev.interfaces);
+    return iface ? (dev as any)[FOLDED_PROPERTY[iface]] : undefined;
 }
 
 /**
@@ -95,6 +97,12 @@ export class CameraPublisher {
     private running?: Promise<boolean>;
     private dirty = false;
     private stopped = false;
+    private rawClasses = new RawClasses((cls, on) => this.state(`${RAW_PREFIX}${cls}`, on));
+    /** detections from these (the camera's mixins and their plugins) are not the camera's own */
+    private mixinSources = new Set<string>();
+    /** ids of the devices folded into the camera at the last refresh */
+    private foldedIds = new Set<string>();
+    private ambiguousLogged = '';
 
     constructor(readonly id: string, private host: CameraHost) { }
 
@@ -103,12 +111,27 @@ export class CameraPublisher {
         return d?.interfaces?.includes(ScryptedInterface.VideoCamera) ? d : undefined;
     }
 
-    private children(): Dev[] {
-        const state = sdk.systemManager.getSystemState();
-        return Object.keys(state)
-            .filter(id => id !== this.id && state[id]?.providerId?.value === this.id)
-            .map(id => sdk.systemManager.getDeviceById<Dev>(id))
-            .filter((c): c is Dev => !!c && !c.interfaces?.includes(ScryptedInterface.VideoCamera));
+    /**
+     * The children and companions folded into this camera's device (fold.ts), and those folded before that still exist
+     * and belong to no other camera: a device leaves the camera's device only when it positively goes.
+     */
+    private folded(state: SystemState, all: DeviceFacts[], memory: CameraMemory): Dev[] {
+        const me = all.find(f => f.id === this.id);
+        if (!me) return [];
+        const found = foldedDevices(me, all);
+        const ambiguous = found.ambiguous.map(d => d.name).join(', ');
+        if (ambiguous && ambiguous !== this.ambiguousLogged)
+            this.host.console.warn(`${me.name}: not folded, more than one camera has this name: ${ambiguous}`);
+        this.ambiguousLogged = ambiguous;
+        return stableFolded(me, found.devices, memory.folded, all, id => this.host.foldedElsewhere(this.id, id))
+            .filter(f => state[f.id])
+            .map(f => sdk.systemManager.getDeviceById<Dev>(f.id))
+            .filter((c): c is Dev => !!c);
+    }
+
+    /** Ids of the devices folded into this camera at the last refresh. */
+    folds(id: string): boolean {
+        return this.foldedIds.has(id);
     }
 
     /**
@@ -140,21 +163,48 @@ export class CameraPublisher {
             this.withdraw();
             return false;
         }
+        const state = sdk.systemManager.getSystemState();
+        const all = allFacts(state);
+        const memory = this.host.memory(this.id);
         const ifs = d.interfaces || [];
-        const children = this.children();
+        const children = this.folded(state, all, memory);
         const entities: EntitySpec[] = [];
+        /** the Scrypted plugin each entity is read from, for the add-on entities it takes over */
+        const origin = new Map<string, string | undefined>();
         if (ifs.includes(ScryptedInterface.Online)) entities.push({ key: 'online', name: 'Online', platform: 'binary_sensor', device_class: 'connectivity', category: 'diagnostic' });
         if (ifs.includes(ScryptedInterface.MotionSensor)) entities.push({ key: 'motion', name: 'Motion', platform: 'binary_sensor', device_class: 'motion' });
         if (ifs.includes(ScryptedInterface.OccupancySensor)) entities.push({ key: 'occupancy', name: 'Occupancy', platform: 'binary_sensor', device_class: 'occupancy' });
+        if (ifs.includes(ScryptedInterface.AudioSensor)) entities.push({ key: 'audio', name: 'Sound', platform: 'binary_sensor', device_class: 'sound' });
         if (ifs.includes(ScryptedInterface.ObjectDetector)) {
             const types = await withTimeout(d.getObjectTypes!(), LOOKUP_TIMEOUT_MS, 'object types').catch(() => undefined);
             const eventTypes = [...new Set((types?.classes ?? []).filter(c => c !== 'motion').map(eventType).filter((t): t is string => !!t))].slice(0, 64);
             entities.push({ key: 'detection', name: 'Object detected', platform: 'event', event_types: eventTypes });
         }
         if (ifs.includes(ScryptedInterface.Battery)) entities.push({ key: 'battery', name: 'Battery', platform: 'sensor', device_class: 'battery', unit: '%', state_class: 'measurement', category: 'diagnostic' });
+        const folded: EntitySpec[] = [];
         for (const c of children) {
-            const e = childEntity(c, String(d.name || ''));
-            if (e) entities.push(e);
+            const e = foldedEntity({ id: c.id, name: c.name, interfaces: c.interfaces }, String(d.name || ''), c.providerId === this.id);
+            if (!e) continue;
+            folded.push(e);
+            origin.set(e.key, c.pluginId);
+        }
+        // the classes the camera itself has reported (remembered, so the list never shrinks); a raw device of the same key wins
+        const raw = ifs.includes(ScryptedInterface.ObjectDetector) ? rawEntities(memory.classes ?? []) : [];
+        const beside = rawBesideFolded(raw, folded);
+        for (const e of beside.raw) {
+            entities.push(e);
+            origin.set(e.key, d.pluginId);
+        }
+        entities.push(...folded);
+        const addons = this.host.addons(this.id, state);
+        const replaces: Record<string, string[]> = {};
+        for (const e of entities) {
+            if (!origin.has(e.key)) continue;
+            const now = [...replacesFor(e, origin.get(e.key), addons) ?? [], ...beside.replaces[e.key] ?? []];
+            const r = mergeReplaces(now, memory.replaces?.[e.key], e.platform, source => addons.find(a => a.source === source)?.entities);
+            if (!r) continue;
+            e.replaces = r;
+            replaces[e.key] = r;
         }
 
         const urls = await this.streamUrls(d);
@@ -165,7 +215,7 @@ export class CameraPublisher {
         if (d.info?.firmware) device.sw_version = String(d.info.firmware).slice(0, 255);
         if (urls.main) device.stream = urls.main;
         if (urls.high) device.streams = [{ key: 'high', name: 'High resolution', url: urls.high } satisfies StreamSpec];
-        const payload: ConfigPayload = { v: CONTRACT_VERSION, device, entities };
+        const payload: ConfigPayload = { v: CONTRACT_VERSION, min_integration: MIN_INTEGRATION, device, entities };
         const json = JSON.stringify(payload);
 
         const declared = new Set(entities.map(e => e.key));
@@ -179,10 +229,28 @@ export class CameraPublisher {
             this.config = json;
             this.host.publish('config', this.id, json);
         }
-        const watched = [this.id, ...children.map(c => c.id)].join(',');
-        if (watched !== this.boundTo) this.bind(d, children, watched);
+        this.foldedIds = new Set(children.map(c => c.id));
+        // read again: a class seen while this refresh waited is kept
+        const latest = this.host.memory(this.id);
+        const next: CameraMemory = { classes: latest.classes, folded: [...this.foldedIds], replaces };
+        if (JSON.stringify(next) !== JSON.stringify(latest)) this.host.remember(this.id, next);
+        const mine = all.find(f => f.id === this.id);
+        this.mixinSources = new Set((mine?.mixins ?? []).flatMap(m => [m, String(state[m]?.pluginId?.value ?? '')]).filter(Boolean));
+        const watched = JSON.stringify([this.id, children.map(c => c.id)]);
+        if (watched !== this.boundTo) this.bind(children, watched);
         this.publishStates(d, children);
         return true;
+    }
+
+    /** A class the camera itself reported: remembered, and the camera gets its entity (an add-on's of that name hands over). */
+    private rawSeen(classes: string[]) {
+        if (!classes.length) return;
+        const memory = this.host.memory(this.id);
+        const known = new Set(memory.classes ?? []);
+        const fresh = classes.filter(c => !known.has(c));
+        if (!fresh.length || known.size >= MAX_RAW_CLASSES) return;
+        this.host.remember(this.id, { ...memory, classes: [...known, ...fresh].slice(0, MAX_RAW_CLASSES) });
+        this.refresh().catch(e => this.host.console.warn(`camera ${this.id}: ${(e as Error).message}`));
     }
 
     /**
@@ -216,19 +284,26 @@ export class CameraPublisher {
         return next.urls;
     }
 
-    private bind(d: Dev, children: Dev[], watched: string) {
+    private bind(children: Dev[], watched: string) {
         this.unbind();
         const sm = sdk.systemManager;
-        const on = (id: string, iface: ScryptedInterface, fn: (data: any) => void) =>
-            this.listeners.push(sm.listenDevice(id, iface, (_s, _d, data) => { if (!this.stopped) fn(data); }));
+        const on = (id: string, iface: ScryptedInterface, fn: (data: any, mixinId?: string) => void) =>
+            this.listeners.push(sm.listenDevice(id, iface, (_s, details, data) => { if (!this.stopped) fn(data, details?.mixinId); }));
         on(this.id, ScryptedInterface.Online, v => this.state('online', v));
         on(this.id, ScryptedInterface.MotionSensor, v => this.state('motion', v));
         on(this.id, ScryptedInterface.OccupancySensor, v => this.state('occupancy', v));
+        on(this.id, ScryptedInterface.AudioSensor, v => this.state('audio', v));
         on(this.id, ScryptedInterface.Battery, v => this.state('battery', v));
-        on(this.id, ScryptedInterface.ObjectDetector, (v: ObjectsDetected) => this.detections(v));
-        for (const c of children)
-            for (const iface of [ScryptedInterface.OnOff, ScryptedInterface.OccupancySensor, ScryptedInterface.MotionSensor, ScryptedInterface.BinarySensor])
-                if (c.interfaces?.includes(iface)) on(c.id, iface, () => this.state(`${CHILD_PREFIX}${c.id}`, childState(sm.getDeviceById<Dev>(c.id))));
+        // detection events are never masked by a mixin: every listener gets the camera's and its mixins'
+        on(this.id, ScryptedInterface.ObjectDetector, (v: ObjectsDetected, mixinId) => {
+            this.detections(v);
+            if (!v || !isCameraDetection(v.sourceId, mixinId, this.mixinSources)) return;
+            this.rawSeen(this.rawClasses.frame(String(v.sourceId ?? ''), (v.detections ?? []).map(x => x?.className)));
+        });
+        for (const c of children) {
+            const iface = foldedInterface(c.interfaces);
+            if (iface) on(c.id, iface as ScryptedInterface, () => this.state(`${CHILD_PREFIX}${c.id}`, foldedState(sm.getDeviceById<Dev>(c.id))));
+        }
         this.boundTo = watched;
     }
 
@@ -242,10 +317,13 @@ export class CameraPublisher {
         if (this.entities.has('online')) this.state('online', d.online);
         if (this.entities.has('motion')) this.state('motion', d.motionDetected);
         if (this.entities.has('occupancy')) this.state('occupancy', d.occupied);
+        if (this.entities.has('audio')) this.state('audio', d.audioDetected);
         if (this.entities.has('battery')) this.state('battery', d.batteryLevel);
+        for (const [k, e] of this.entities)
+            if (k.startsWith(RAW_PREFIX) && e.platform === 'binary_sensor') this.state(k, this.rawClasses.isOn(k.slice(RAW_PREFIX.length)));
         for (const c of children) {
             const k = `${CHILD_PREFIX}${c.id}`;
-            if (this.entities.has(k)) this.state(k, childState(c));
+            if (this.entities.has(k)) this.state(k, foldedState(c));
         }
     }
 
@@ -288,7 +366,7 @@ export class CameraPublisher {
         if (!e || e.platform !== 'switch' || !key.startsWith(CHILD_PREFIX)) return false;
         const childId = key.slice(CHILD_PREFIX.length);
         const child = sdk.systemManager.getDeviceById<Dev>(childId);
-        if (!child || sdk.systemManager.getSystemState()[childId]?.providerId?.value !== this.id || !child.interfaces?.includes(ScryptedInterface.OnOff)) return false;
+        if (!child || !this.foldedIds.has(childId) || !child.interfaces?.includes(ScryptedInterface.OnOff)) return false;
         await (value === 'ON' ? child.turnOn!() : child.turnOff!());
         return true;
     }
@@ -330,6 +408,8 @@ export class CameraPublisher {
         this.states.clear();
         this.entities.clear();
         this.unbind();
+        this.rawClasses.clear();
+        this.foldedIds.clear();
     }
 
     /** Republish everything after a broker reconnection. */
@@ -342,6 +422,7 @@ export class CameraPublisher {
         clearTimeout(this.streamRetry);
         if (withdraw) this.withdraw();
         else this.unbind();
+        this.rawClasses.clear();
         this.stopped = true;
     }
 }

@@ -262,3 +262,30 @@ test('an alive asking for a hello is passed on, a plain alive is not', () => {
     relay.handle('p1', msg('alive', { hello: 'yes' }));
     assert.deepEqual(added, ['guard', 'hello? guard']);
 });
+
+test('configsFor lists every source on a device with the plugin device that sent it', () => {
+    const { relay } = setup();
+    relay.handle('p1', msg('config', { entities: presence }));
+    relay.handle('p2', { ...msg('config', { entities: [presence[0]] }), source: 'cam' });
+    assert.deepEqual(relay.configsFor('42').map(c => [c.source, c.owner, c.entities.map(e => e.key).join(',')]), [['guard', 'p1', 'person,seen'], ['cam', 'p2', 'person']]);
+    assert.deepEqual(relay.configsFor('43'), []);
+    relay.handle('p1', msg('withdraw'));
+    assert.deepEqual(relay.configsFor('42').map(c => c.source), ['cam']);
+});
+
+test('configChanged fires for a new, changed or withdrawn config, not for replays', () => {
+    const changed: string[] = [];
+    const relay = new AddonRelay({
+        config: () => { }, state: () => { }, event: () => { }, image: () => { }, status: () => { },
+        configChanged: d => changed.push(d),
+    }, () => true, () => { }, () => 1000);
+    relay.handle('p1', msg('config', { entities: presence }));
+    relay.handle('p1', msg('config', { entities: presence }));
+    relay.republish();
+    relay.devicePublished('42');
+    assert.deepEqual(changed, ['42']);
+    relay.handle('p1', msg('config', { entities: [presence[0]] }));
+    relay.handle('p1', msg('withdraw'));
+    relay.handle('p1', msg('withdraw'));
+    assert.deepEqual(changed, ['42', '42', '42']);
+});

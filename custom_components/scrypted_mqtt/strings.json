@@ -13,5 +13,11 @@
       "mqtt_not_configured": "Set up the MQTT integration first.",
       "single_instance_allowed": "Scrypted MQTT is already set up."
     }
+  },
+  "issues": {
+    "integration_too_old": {
+      "title": "Update the Scrypted MQTT integration",
+      "description": "The Scrypted MQTT bridge needs integration {required} or newer, and {current} is installed. Until it is updated, entities the bridge reads from standard interfaces may appear next to the add-on entities they replace, with new entity ids. Update the integration first, then the bridge."
+    }
   }
 }

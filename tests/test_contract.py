@@ -109,3 +109,34 @@ def test_camera_is_not_a_source_name() -> None:
     assert parse_topic("scrypted", "scrypted/devices/42/camera/config") is None
     assert parse_topic("scrypted", "scrypted/devices/42/camera/state/high") is None
     assert parse_topic("scrypted", "scrypted/sources/camera/status") is None
+
+
+def test_replaces_names_add_on_or_bridge_entities() -> None:
+    entity = {"key": "child_9", "name": "Presence", "platform": "binary_sensor"}
+    good = {**entity, "replaces": ["guard:person", "cam:people", "guard:person", "bridge:camera_motion"]}
+    payload = json.dumps({"v": 1, "device": {"name": "Front door"}, "entities": [good]}).encode()
+    assert parse_config(payload, "bridge").entities[0].replaces == (("guard", "person"), ("cam", "people"), ("bridge", "camera_motion"))
+    for bad in (["camera:x"], ["guard"], ["guard:Bad"], "guard:person", [1], [f"s{i}:k" for i in range(9)]):
+        cfg = parse_config(json.dumps({"v": 1, "entities": [{**entity, "replaces": bad}]}).encode(), "guard")
+        assert cfg.entities == () and len(cfg.errors) == 1, bad
+
+
+def test_replace_cycles_and_self_references_are_dropped() -> None:
+    entities = [
+        {"key": "a", "name": "A", "platform": "binary_sensor", "replaces": ["bridge:b", "bridge:a", "guard:x"]},
+        {"key": "b", "name": "B", "platform": "binary_sensor", "replaces": ["bridge:a"]},
+        {"key": "c", "name": "C", "platform": "binary_sensor", "replaces": ["bridge:d"]},
+        {"key": "d", "name": "D", "platform": "binary_sensor"},
+    ]
+    payload = json.dumps({"v": 1, "device": {"name": "Front door"}, "entities": entities}).encode()
+    cfg = parse_config(payload, "bridge")
+    assert {e.key: e.replaces for e in cfg.entities} == {"a": (("guard", "x"),), "b": (), "c": (("bridge", "d"),), "d": ()}
+
+
+def test_integration_version_matches_the_manifest() -> None:
+    from pathlib import Path
+
+    from custom_components.scrypted_mqtt.const import VERSION
+
+    manifest = Path(__file__).parent.parent / "custom_components" / "scrypted_mqtt" / "manifest.json"
+    assert json.loads(manifest.read_text())["version"] == VERSION

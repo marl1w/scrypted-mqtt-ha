@@ -6,11 +6,13 @@ The agreement between whatever publishes camera data from Scrypted and the Home 
 
 | Part | Runs in | Job |
 |---|---|---|
-| **Bridge** | Scrypted (`scrypted-plugin/`) | Publishes each selected camera: its description, its stream, its standard sensors and controls, and its snapshots. Owns the broker connection. Relays add-ons from other Scrypted plugins. |
-| **Add-on** | any Scrypted plugin (section 10), or anything that can reach the broker | Adds entities to a camera the bridge publishes. |
+| **Bridge** | Scrypted (`scrypted-plugin/`) | Publishes each selected camera: its description, its stream, its snapshots, and everything Scrypted's standard interfaces tell about it, on the camera and on the devices that belong to it (section 10). Owns the broker connection. Relays add-ons from other Scrypted plugins. |
+| **Add-on** | any Scrypted plugin (section 10), or anything that can reach the broker | Adds entities to a camera the bridge publishes, for what no standard interface carries (such as a picture of the last detection). |
 | **Integration** | Home Assistant (`custom_components/scrypted_mqtt/`) | Builds one device per camera from everything published for it. Knows nothing about cameras, brands or detectors. |
 
 Everything a camera shows in Home Assistant comes from a **source**. The bridge is the source named `bridge`; it is the only one that may describe the device itself.
+
+**Standard interfaces first.** What another Scrypted plugin exposes through a standard Scrypted interface (a sensor, a switch, a child device, the camera's own motion and detections) the bridge reads by itself, so the plugin publishes nothing for Home Assistant. The add-on channel is for extras no standard interface covers. When both carry the same thing, the bridge's entity wins (`replaces`, sections 4 and 9).
 
 ## 2. Identifiers
 
@@ -55,6 +57,7 @@ The bridge's own status topic is its MQTT last will, so the broker marks it `off
 ```
 
 - `v`: contract major version. The integration ignores a config with a major it does not know and logs it once.
+- `min_integration`: **bridge only**, optional: the oldest integration version (`0.2.0`) that handles everything the config carries. An older integration that knows the field logs a warning and raises a repair issue, and keeps working as far as it can.
 - `device`: **only the `bridge` source sends it**, and the integration ignores it from any other source. `stream` is the RTSP URL Home Assistant plays; it may be missing (no live view, snapshots only). `streams` lists further streams, `{"key", "name", "url"}` each (`key` as in section 2, at most 4), and each becomes one more camera entity on the device (the bridge sends the highest-resolution stream as `high`, "High resolution", when it is not the main one). Optional: `model`, `manufacturer`, `sw_version`, `streams`.
 - `entities`: the full list this source provides for this device, at most 64. A new config replaces the previous list: entities missing from it are removed.
 - An empty retained payload withdraws the config: the source's entities on that device are removed, and if the source is `bridge`, the device with everything on it.
@@ -74,6 +77,7 @@ The bridge's own status topic is its MQTT last will, so the broker marks it `off
 | `enabled` | no | `false` creates the entity disabled. Default `true`. |
 | `icon` | no | `mdi:…` |
 | `object_id` | no | entity id (without the platform) to use the **first** time the entity is created, `[a-z0-9_]+`. Ignored afterwards, so a rename made in Home Assistant is kept. Default: the device name plus the entity name, as Home Assistant derives it. |
+| `replaces` | no | **bridge only**, ignored from any other source: entities of the same device this one takes over, as `"<source>:<key>"`, at most 8 (section 9): an add-on's, or a bridge entity it supersedes. |
 
 ## 5. States and events
 
@@ -122,6 +126,9 @@ The integration publishes `{"id": "<request id>", "width": 640}` to `bridge/snap
 - Device identifier: `("scrypted_mqtt", "<root>:<device>")`.
 - Camera entity: unique id `<root>:<device>:camera`, named after the device; one more per extra stream, unique id `<root>:<device>:camera:<key>`, named by the stream's `name` (which is why no source may be called `camera`). Plays `device.stream` (Home Assistant's go2rtc gives live view over WebRTC) and takes snapshots through section 7.
 - Other entities: unique id `<root>:<device>:<source>:<key>`.
+- **Replaced entities.** An entity a `bridge` entity names in `replaces` (an add-on's, or another key of the bridge's) is not created: the bridge's entity wins, the add-on's other keys are kept, and its state for that key is ignored. `replaces` naming the entity's own key, or a bridge key that itself declares `replaces`, is ignored (no chains, no cycles).
+- **Hand-over.** If the replaced entity is in the entity registry, its entry is handed to the bridge's entity (its unique id becomes the bridge's, the old one kept as `previous_unique_id`), so the entity id, history, area, labels and every other customisation stay; a live entity is taken down first. **Back:** an entity about to be created with no entry of its own gets the entry whose `previous_unique_id` is its unique id, when that entry's current unique id is no longer wanted; so a rollback, or a device that stops and starts being folded, loses nothing either way. **Leaving:** a bridge entity no longer wanted hands its entry to an entity its last `replaces` named that is wanted now and has no entry (a raw-signal child removed, its derived entity back). An add-on entity whose unique id is the `previous_unique_id` of a wanted entity of the same device is not created, even if the bridge briefly stops naming it; and while an entity a bridge entity replaces is being handed over, the bridge's waits rather than appearing beside it.
+- **Both have an entry** (one was made while the other was not yet handed over): the one kept is the customised one (area, labels, name, icon, disabled or hidden by the user), then the one whose entity id has no `_2`-style suffix, then the older; the other is removed, with a warning that names both. A hand-over that fails is logged and left alone (both unique ids untouched) until Home Assistant restarts; the others go ahead.
 - The integration subscribes to `<root>/#` through Home Assistant's MQTT integration and needs no setting other than `root`.
 
 ## 10. Bridge
@@ -137,10 +144,40 @@ Base entities, each present only when the camera has the matching Scrypted inter
 | `online` | binary_sensor `connectivity`, diagnostic | `Online` |
 | `motion` | binary_sensor `motion` | `MotionSensor`, after any mixin |
 | `occupancy` | binary_sensor `occupancy` | `OccupancySensor` |
+| `audio` | binary_sensor `sound` | `AudioSensor` |
 | `detection` | event | `ObjectDetector`. One event per distinct class in each detection payload, `motion` skipped, `event_type` = class name, attributes `label`, `score` (two decimals) and `zones`. At most one event per class every 5 s: a class that stays in view keeps firing at that pace. |
 | `battery` | sensor `battery`, `%`, diagnostic | `Battery` |
 
-Each child device of the camera (its `providerId` is the camera) that is not a camera itself becomes entities on the camera's device, keyed `child_<child id>`, named after the child without the camera's name: `OnOff` as a switch, else `OccupancySensor`, `MotionSensor` or `BinarySensor` as a binary sensor.
+**Folded devices.** These devices become entities on the camera's device, keyed `child_<device id>`, named after the device without the camera's name in front:
+
+- the camera's **children** (their `providerId` is the camera), such as a siren, a floodlight, a day/night sensor or a raw-signal sensor (below);
+- its **companions**: devices of a plugin that is a mixin on the camera, named `<camera name> <what>`, such as a mixin's per-class presence or tamper sensors (a mixin cannot make children of another plugin's camera, so the name is the link). The longest camera name that fits wins, whichever mixins that camera has; a device whose provider is another camera is never a companion; when two cameras have that same name, the device is folded into neither and the bridge logs it.
+
+A device that is a camera itself (a crop or mirror view) is left out; it is a camera of its own. The first interface it has picks the entity:
+
+| Interface | Platform |
+|---|---|
+| `OnOff` | switch (commands go to the device) |
+| `OccupancySensor` | binary_sensor `occupancy` |
+| `AudioSensor` | binary_sensor `sound` |
+| `MotionSensor` | binary_sensor `motion` |
+| `BinarySensor` | binary_sensor |
+
+A device folded once stays on the camera's device until it is removed from Scrypted, folds into another camera, or is no longer acceptable (a companion whose plugin is no longer a mixin on the camera; a raw-signal device not from the camera or its plugin): a restart, a slow plugin or a rename never makes its entity disappear (and Home Assistant would drop its registry entry).
+
+**Raw signals.** The camera's own motion and AI classes, before any mixin judges them:
+
+| Key | Platform | From |
+|---|---|---|
+| `child_<id>` named `Camera motion` | binary_sensor `motion` | a `MotionSensor` child named `<camera> Camera motion`: the camera plugin's exact level. |
+| `child_<id>` named `Camera <class>` | binary_sensor `occupancy` (or plain) | an `OccupancySensor` or `BinarySensor` child named `<camera> Camera <class>` (`person`, `vehicle`, `animal`, …): the camera plugin's exact level. |
+| `camera_<class>` | binary_sensor `occupancy` | for a class with no such child: derived from the camera's `ObjectDetector` events, normalised (`people` → `person`, `dog_cat` → `animal`, others as their slug, `motion` skipped), named `Camera <class>`. Detection events are never hidden by a mixin, so the bridge reads them on the camera and drops those a mixin on the camera sent (`sourceId` or the event's `mixinId` is a mixin provider on the camera, or its plugin). On with a detection that carries it; off when the same source sends one without it (an empty one turns all of its classes off), or 2.5 s after the last one that carried it. The classes seen are remembered across restarts, so the list only grows. |
+
+A raw-signal device is taken only from the camera itself (`providerId`) or the camera's own plugin; one from any other plugin is not folded. A camera plugin may name its children after the camera's name on the recorder rather than the Scrypted camera's (which the user may have renamed): for the camera's own sensor children the bridge reads the name from its last word `Camera` on (`<anything> Camera person` is `Camera person`). A raw-signal device replaces `bridge:camera_<key>`, so a derived entity published before hands its entry over. The bridge derives no raw motion: when no mixin overrides the camera's `MotionSensor`, `motion` already is the camera's own, and when one does, the bridge cannot tell which without asking mixin providers. Raw motion comes from a `Camera motion` child.
+
+**Replacing add-on entities.** A folded device or raw signal takes over (`replaces`, section 9) every add-on entity on the same camera that comes from the same Scrypted plugin (the plugin of the folded device, or the camera's plugin for raw signals) and has the same platform and name, case aside. So a plugin that published such an entity as an add-on before its standard interface was read can stop publishing it, and Home Assistant keeps the entity, its id and its history. The bridge remembers what each entity replaced across restarts and merges it with what it finds: an entry is dropped only once that source's current config for the camera no longer has that key on the entity's platform, so a restart, when the bridge publishes before the add-ons resend, never brings the add-on's entity back. What the bridge remembers of a camera is forgotten when the camera is no longer published.
+
+**Upgrade order.** 1. The integration (0.2.0 or newer). 2. The bridge: its entities take over the add-ons' and Home Assistant hands their entries over. 3. Only after checking that (the unique ids are now `<root>:<device>:bridge:…`), the add-ons stop publishing what the bridge now reads. A bridge running ahead of the integration says so through `min_integration`.
 
 ### Add-ons inside Scrypted
 
