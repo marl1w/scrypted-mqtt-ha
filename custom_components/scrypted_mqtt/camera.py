@@ -36,6 +36,8 @@ class ScryptedMqttCamera(Camera):
         self._attr_device_info = DeviceInfo(identifiers={hub.device_identifier(device)})
         if spec:
             self._attr_name = spec.name
+            # an extra stream of the same camera: on the device page, not a second camera on dashboards
+            self._attr_entity_registry_visible_default = False
 
     @property
     def available(self) -> bool:
