@@ -4,6 +4,18 @@ export interface StreamUrls {
     high?: string;
 }
 
+/**
+ * The rebroadcast URL of a Rebroadcast synthetic stream called `name`, as listed in the camera's settings (Rebroadcast
+ * shows it under "Stream: Stream <name>"; synthetic streams are not among the stream options). With audio only: the
+ * point of such a stream is its audio, already in Opus, which Home Assistant's go2rtc then passes through instead of
+ * transcoding the camera's AAC in an ffmpeg of its own.
+ */
+export function syntheticStreamUrl(settings: { key?: string; subgroup?: string; value?: unknown }[], name: string, audio: boolean): string | undefined {
+    if (!audio || !name) return undefined;
+    const s = settings.find(x => x.key === 'prebuffer:rtspRebroadcastUrl' && x.subgroup === `Stream: Stream ${name}`);
+    return typeof s?.value === 'string' && s.value ? s.value : undefined;
+}
+
 /** The URLs are looked up again after this long even when the stream options did not change. */
 const STREAM_URL_TTL_MS = 60 * 60_000;
 /** A lookup that loses a URL is retried this soon, twice as late each time, STREAM_RETRIES times before the loss is believed. */

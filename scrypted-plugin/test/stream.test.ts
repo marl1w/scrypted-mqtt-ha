@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { STREAM_RETRIES, STREAM_RETRY_MS, StreamUrlKeeper } from '../src/stream';
+import { STREAM_RETRIES, STREAM_RETRY_MS, StreamUrlKeeper, syntheticStreamUrl } from '../src/stream';
 
 const good = { main: 'rtsp://127.0.0.1:40000/main', high: 'rtsp://127.0.0.1:40000/high' };
 
@@ -33,4 +33,16 @@ test('a camera without a rebroadcast retries a few times, then stops asking', ()
     for (let i = 0; i < STREAM_RETRIES; i++) assert.equal(k.update('a', {}).retryMs, STREAM_RETRY_MS * 2 ** i);
     assert.deepEqual(k.update('a', {}), { urls: {} });
     assert.deepEqual(k.update('a', undefined), { urls: {} });
+});
+
+test('a synthetic stream of the configured name is found by its rebroadcast URL, with audio only', () => {
+    const settings = [
+        { key: 'prebuffer:rtspRebroadcastUrl', subgroup: 'Stream: RTMP sub', value: 'rtsp://localhost:40000/sub' },
+        { key: 'prebuffer:rtspRebroadcastMutedUrl', subgroup: 'Stream: Stream opus', value: 'rtsp://localhost:40000/muted' },
+        { key: 'prebuffer:rtspRebroadcastUrl', subgroup: 'Stream: Stream opus', value: 'rtsp://localhost:40000/opus' },
+    ];
+    assert.equal(syntheticStreamUrl(settings, 'opus', true), 'rtsp://localhost:40000/opus');
+    assert.equal(syntheticStreamUrl(settings, 'opus', false), undefined, 'muted: the default stream');
+    assert.equal(syntheticStreamUrl(settings, '', true), undefined, 'off');
+    assert.equal(syntheticStreamUrl(settings, 'other', true), undefined, 'camera without it');
 });

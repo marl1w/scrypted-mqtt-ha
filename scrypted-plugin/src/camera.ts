@@ -1,6 +1,6 @@
 import sdk, { Battery, BinarySensor, Camera, EventListenerRegister, ResponseMediaStreamOptions, MotionSensor, ObjectDetector, ObjectsDetected, OccupancySensor, OnOff, Online, ScryptedDevice, ScryptedInterface, Settings, VideoCamera } from '@scrypted/sdk';
 import { ConfigPayload, CONTRACT_VERSION, DeviceSpec, encodeState, EntitySpec, eventType, SnapshotRequest, StreamSpec, streamUrlFor } from './contract';
-import { StreamUrlKeeper, StreamUrls } from './stream';
+import { StreamUrlKeeper, StreamUrls, syntheticStreamUrl } from './stream';
 
 type Dev = ScryptedDevice & Partial<VideoCamera & Camera & MotionSensor & OccupancySensor & Online & Battery & ObjectDetector & OnOff & BinarySensor & Settings>;
 
@@ -11,6 +11,8 @@ export interface CameraHost {
     streamHost(): string;
     /** false: the rebroadcast without audio (no AAC for WebRTC to stumble on) */
     streamAudio(): boolean;
+    /** name of a Rebroadcast synthetic stream that, where a camera has it, Home Assistant plays instead (empty: none) */
+    opusStream(): string;
     console: Console;
 }
 
@@ -56,7 +58,7 @@ function childState(child: Dev): boolean | undefined {
  * The RTSP rebroadcasts Home Assistant plays, as it reaches them: Rebroadcast's default stream (a cropped view where one
  * is configured, else a prebuffered one), and the highest-resolution stream when that is another one.
  */
-async function rebroadcastUrls(d: Dev, options: ResponseMediaStreamOptions[], host: string, audio: boolean): Promise<StreamUrls> {
+async function rebroadcastUrls(d: Dev, options: ResponseMediaStreamOptions[], host: string, audio: boolean, opus: string): Promise<StreamUrls> {
     if (!options.length || !d.interfaces?.includes(ScryptedInterface.Settings)) return {};
     const settings = await withTimeout(d.getSettings!(), LOOKUP_TIMEOUT_MS, 'settings');
     const key = audio ? 'prebuffer:rtspRebroadcastUrl' : 'prebuffer:rtspRebroadcastMutedUrl';
@@ -70,7 +72,9 @@ async function rebroadcastUrls(d: Dev, options: ResponseMediaStreamOptions[], ho
     const main = options.find(o => o.name === defaultName) ?? options.find(o => o.prebuffer) ?? options.find(o => o.video?.codec === 'h264') ?? options[0];
     // widest stream; RTSP before RTMP at the same width (its codec is declared)
     const high = [...options].sort((a, b) => (b.video?.width ?? 0) - (a.video?.width ?? 0) || Number(b.container === 'rtsp') - Number(a.container === 'rtsp'))[0];
-    const mainUrl = urlOf(main) ?? (urls.length === 1 ? streamUrlFor(String(urls[0].value), host) : undefined);
+    const synthetic = syntheticStreamUrl(settings, opus, audio);
+    const mainUrl = (synthetic && streamUrlFor(synthetic, host))
+        ?? urlOf(main) ?? (urls.length === 1 ? streamUrlFor(String(urls[0].value), host) : undefined);
     const highUrl = high && high !== main && (high.video?.width ?? 0) > (main?.video?.width ?? 0) ? urlOf(high) : undefined;
     return { main: mainUrl, high: highUrl };
 }
@@ -192,10 +196,11 @@ export class CameraPublisher {
                 ? await withTimeout(d.getVideoStreamOptions!(), LOOKUP_TIMEOUT_MS, 'stream options')
                 : [];
             const audio = this.host.streamAudio();
-            key = JSON.stringify([this.host.streamHost(), audio, options.map(o => [o.id, o.name, !!o.prebuffer])]);
+            const opus = this.host.opusStream();
+            key = JSON.stringify([this.host.streamHost(), audio, opus, options.map(o => [o.id, o.name, !!o.prebuffer])]);
             const cached = this.stream.cached(key);
             if (cached) return cached;
-            urls = await rebroadcastUrls(d, options, this.host.streamHost(), audio);
+            urls = await rebroadcastUrls(d, options, this.host.streamHost(), audio, opus);
         }
         catch (e) {
             this.host.console.warn(`${d.name}: no stream URL (${(e as Error).message})`);

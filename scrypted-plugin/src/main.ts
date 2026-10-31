@@ -43,9 +43,15 @@ class ScryptedMqttBridge extends ScryptedDeviceBase implements Settings {
         },
         streamAudio: {
             title: 'Stream audio',
-            description: "Off: Home Assistant gets Scrypted's rebroadcast without audio, so WebRTC live view never stalls on the camera's AAC audio.",
+            description: "Off: Home Assistant gets Scrypted's rebroadcast without audio. On: with audio; see Opus stream for audio that go2rtc needs not transcode.",
             type: 'boolean',
             defaultValue: false,
+            onPut: () => this.refreshAll(),
+        },
+        opusStream: {
+            title: 'Opus stream',
+            description: "With audio: a camera that has a Rebroadcast synthetic stream of this name (audio already in Opus, e.g. output prefix `-c:v copy -c:a libopus -application:a lowdelay -frame_duration 20 -ar:a 48000 -ac:a 1 -b:a 32k -muxdelay 0`) gets that one as its Home Assistant stream, so go2rtc passes the audio through instead of transcoding it. Leave the stream out of the prebuffered ones: it runs only while someone watches. Empty: off.",
+            defaultValue: 'opus',
             onPut: () => this.refreshAll(),
         },
         cameras: {
@@ -357,6 +363,7 @@ class ScryptedMqttBridge extends ScryptedDeviceBase implements Settings {
                 },
                 streamHost: () => String(this.storageSettings.values.streamHost || '127.0.0.1'),
                 streamAudio: () => !!this.storageSettings.values.streamAudio,
+                opusStream: () => String(this.storageSettings.values.opusStream ?? '').trim(),
                 console: this.console,
             });
             this.cameras.set(id, c);

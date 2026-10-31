@@ -24,6 +24,8 @@ Requirements: Home Assistant 2026.1 or newer with the MQTT integration set up, a
 
 **Stream host** in the plugin is the address Home Assistant uses to reach Scrypted's rebroadcast. Keep `127.0.0.1` when Scrypted runs as a Home Assistant add-on or otherwise shares the host network.
 
+**Audio**: with Stream audio on, Home Assistant's go2rtc transcodes the camera's AAC to Opus in an ffmpeg of its own, which starts late and lags the live view. To avoid it, add a Rebroadcast synthetic stream named `opus` to the camera (Rebroadcast → Synthetic Streams; input: the prebuffered stream; parser FFmpeg (TCP); output prefix `-c:v copy -c:a libopus -application:a lowdelay -frame_duration 20 -ar:a 48000 -ac:a 1 -b:a 32k -muxdelay 0`) and leave it unprebuffered: the bridge then gives Home Assistant that stream, which transcodes only while someone watches (a few % of a core per viewer). The name is the bridge's Opus stream setting.
+
 **High resolution**: a camera whose highest-resolution stream is not its default one gets a second camera entity, **High resolution**, enabled like the main one. Leave that stream unprebuffered in Rebroadcast: Scrypted then opens a main-stream session to the camera only while someone watches it, and the default camera keeps serving dashboards and snapshots.
 
 **Recorder**: an add-on's pictures (such as the last detection) change their entity's state each time. To keep them out of the history database:
