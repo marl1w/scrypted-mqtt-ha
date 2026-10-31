@@ -183,7 +183,7 @@ export class CameraPublisher {
         if (ifs.includes(ScryptedInterface.Battery)) entities.push({ key: 'battery', name: 'Battery', platform: 'sensor', device_class: 'battery', unit: '%', state_class: 'measurement', category: 'diagnostic' });
         const folded: EntitySpec[] = [];
         for (const c of children) {
-            const e = foldedEntity({ id: c.id, name: c.name, interfaces: c.interfaces }, String(d.name || ''), c.providerId === this.id);
+            const e = foldedEntity({ id: c.id, name: c.name, interfaces: c.interfaces }, [String(d.name || ''), String((d as any).providedName || '')], c.providerId === this.id);
             if (!e) continue;
             folded.push(e);
             origin.set(e.key, c.pluginId);

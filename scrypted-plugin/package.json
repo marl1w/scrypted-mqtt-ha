@@ -1,6 +1,6 @@
 {
   "name": "@marl1w/scrypted-mqtt",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Scrypted plugin that publishes cameras, their sensors, controls and snapshots, and other plugins' add-ons, to MQTT for the Scrypted MQTT Home Assistant integration.",
   "license": "MIT",
   "scripts": {

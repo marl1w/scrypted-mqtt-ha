@@ -302,3 +302,10 @@ test('memory is forgotten at once when certain, else only if the camera is still
     assert.deepEqual(f.sweep(() => false), []);
 
 });
+
+test('an own child named after the camera plugin\'s name for the camera loses that prefix too', () => {
+    const e = foldedEntity({ id: '9', name: 'Recorder Garden Night mode', interfaces: ['BinarySensor'] }, ['Garden cam', 'Recorder Garden'], true);
+    assert.equal(e?.name, 'Night mode');
+    const c = foldedEntity({ id: '9', name: 'Recorder Garden Night mode', interfaces: ['BinarySensor'] }, ['Garden cam', 'Recorder Garden'], false);
+    assert.equal(c?.name, 'Recorder Garden Night mode', 'a companion is matched by the Scrypted name only');
+});

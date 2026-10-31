@@ -42,9 +42,11 @@ export const FOLDED_PROPERTY: Record<FoldedInterface, string> = {
 };
 
 /** A device's name on the camera's device: without the camera's name in front, at most 64 characters. */
-export function foldedName(name: string | undefined, id: string, cameraName: string, own = false): string {
+export function foldedName(name: string | undefined, id: string, cameraName: string | string[], own = false): string {
     let n = String(name || id);
-    if (cameraName && n.startsWith(cameraName + ' ')) n = n.slice(cameraName.length + 1);
+    // the camera's Scrypted name, then (own children) the name its plugin gave it, which a child is often named after
+    const prefix = (Array.isArray(cameraName) ? cameraName : [cameraName]).find(c => c && n.startsWith(c + ' '));
+    if (prefix) n = n.slice(prefix.length + 1);
     else if (own) n = rawSuffix(n) ?? n;
     return n.trim().slice(0, 64) || `Device ${id}`;
 }
@@ -67,11 +69,12 @@ const RAW_INTERFACES: readonly FoldedInterface[] = ['OccupancySensor', 'MotionSe
  * How a child or companion device appears on the camera's device, or undefined to leave it out. An own child (its
  * provider is the camera) that is a sensor named `… Camera <signal>` is named `Camera <signal>`, whatever its prefix.
  */
-export function foldedEntity(dev: { id: string; name?: string; interfaces?: string[] }, cameraName: string, own = false): EntitySpec | undefined {
+export function foldedEntity(dev: { id: string; name?: string; interfaces?: string[] }, cameraName: string | string[], own = false): EntitySpec | undefined {
     const iface = foldedInterface(dev.interfaces);
     if (!iface) return undefined;
     const key = `${CHILD_PREFIX}${dev.id}`;
-    const name = foldedName(dev.name, dev.id, cameraName, own && RAW_INTERFACES.includes(iface));
+    const names = Array.isArray(cameraName) ? cameraName : [cameraName];
+    const name = foldedName(dev.name, dev.id, own ? names : names.slice(0, 1), own && RAW_INTERFACES.includes(iface));
     switch (iface) {
         case 'OnOff': return { key, name, platform: 'switch' };
         case 'OccupancySensor': return { key, name, platform: 'binary_sensor', device_class: 'occupancy' };
