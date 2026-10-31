@@ -12,7 +12,7 @@ One Home Assistant device per Scrypted camera, with everything Scrypted knows ab
 
 - **Camera**: live view from Scrypted's rebroadcast (WebRTC through Home Assistant's go2rtc), snapshots taken by Scrypted.
 - **Sensors** from the camera's Scrypted interfaces: online, motion, occupancy, sound, battery, and an **Object detected** event per detection class.
-- **Devices that belong to the camera**: its children (siren, floodlight, day/night) and its mixins' sensors named after it (presence, tamper), as switches and binary sensors on the same device, read from their standard Scrypted interfaces.
+- **Devices that belong to the camera**: its children (siren, floodlight, day/night) and its mixins' sensors named after it (for example presence or tamper), as switches and binary sensors on the same device, read from their standard Scrypted interfaces.
 - **Raw signals**: the camera's own motion and AI classes as `Camera motion`, `Camera person`, … next to the verified ones: from the camera plugin's `Camera <signal>` child sensors where it has them, else (classes only) from the camera's own detection events, leaving out those of its mixins.
 - **Add-ons**: for what no standard interface carries, any Scrypted plugin can add entities to a camera (contract section 10), pictures included (an image entity, such as the last verified detection). States are exact: on and off as the plugin reports them, with no timers.
 
