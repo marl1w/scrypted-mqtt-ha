@@ -1,10 +1,12 @@
-import { acceptsCommand, BRIDGE_SOURCE, CONTRACT_VERSION, encodeState, EntitySpec, isDevice, isEventType, isKey, isSource, validateEntities } from './contract';
+import { acceptsCommand, BRIDGE_SOURCE, CONTRACT_VERSION, decodeImage, encodeState, EntitySpec, isDevice, isEventType, isKey, isSource, validateEntities } from './contract';
 
 /** Seconds without any message after which a source is published offline. */
 export const SOURCE_TIMEOUT_MS = 90_000;
 const MAX_ATTRIBUTES_BYTES = 4096;
 const MAX_SOURCES = 32;
 const MAX_DEVICES_PER_SOURCE = 256;
+/** Images kept for republishing, all sources together; beyond it a new image is still published but not kept. */
+const MAX_KEPT_IMAGE_BYTES = 32 * 1024 * 1024;
 /** A source's dropped messages are logged at most this often. */
 const DROP_LOG_MS = 60_000;
 
@@ -14,7 +16,11 @@ export interface AddonSink {
     config(device: string, source: string, entities: EntitySpec[] | undefined): void;
     state(device: string, source: string, key: string, payload: string): void;
     event(device: string, source: string, key: string, payload: string): void;
+    /** retained; an empty buffer clears the image */
+    image(device: string, source: string, key: string, jpeg: Buffer): void;
     status(source: string, online: boolean): void;
+    /** a source sent its first message since the bridge started */
+    sourceAdded?(source: string): void;
 }
 
 interface SourceRecord {
@@ -24,6 +30,9 @@ interface SourceRecord {
     online: boolean;
     configs: Map<string, EntitySpec[]>;
     states: Map<string, Map<string, string>>;
+    images: Map<string, Map<string, Buffer>>;
+    /** keys of images published over budget: retained on the broker, so cleared like kept ones, but without their bytes */
+    unkept: Map<string, Set<string>>;
 }
 
 /**
@@ -34,6 +43,7 @@ interface SourceRecord {
 export class AddonRelay {
     private sources = new Map<string, SourceRecord>();
     private dropLoggedAt = new Map<string, number>();
+    private imageBytes = 0;
 
     constructor(
         private sink: AddonSink,
@@ -50,16 +60,25 @@ export class AddonRelay {
             this.apply(owner, msg);
         }
         catch (e) {
-            const now = this.now();
-            if (now - (this.dropLoggedAt.get(owner) ?? -Infinity) < DROP_LOG_MS) return;
-            this.dropLoggedAt.set(owner, now);
-            this.log(`add-on message dropped: ${(e as Error).message}`);
+            this.dropped(owner, `add-on message dropped: ${(e as Error).message}`);
         }
+    }
+
+    private dropped(owner: string, message: string) {
+        const now = this.now();
+        if (now - (this.dropLoggedAt.get(owner) ?? -Infinity) < DROP_LOG_MS) return;
+        this.dropLoggedAt.set(owner, now);
+        this.log(message);
     }
 
     /** True once the source has sent something since the bridge started. */
     hasSource(source: string): boolean {
         return this.sources.has(source);
+    }
+
+    /** True when the source's current config for the device declares `key` as an image entity. */
+    declaresImage(device: string, source: string, key: string): boolean {
+        return !!this.sources.get(source)?.configs.get(device)?.some(e => e.key === key && e.platform === 'image');
     }
 
     private apply(owner: string, msg: any) {
@@ -70,8 +89,9 @@ export class AddonRelay {
         if (rec && rec.owner !== owner) throw new Error(`source ${source} belongs to another plugin`);
         if (!rec) {
             if (this.sources.size >= MAX_SOURCES) throw new Error(`too many sources, ${source} ignored`);
-            rec = { owner, lastSeen: 0, online: false, configs: new Map(), states: new Map() };
+            rec = { owner, lastSeen: 0, online: false, configs: new Map(), states: new Map(), images: new Map(), unkept: new Map() };
             this.sources.set(source, rec);
+            this.sink.sourceAdded?.(source);
         }
         rec.lastSeen = this.now();
         if (!rec.online) {
@@ -85,10 +105,13 @@ export class AddonRelay {
             case 'config':
                 if (!this.isKnown(device)) throw new Error(`${source}: unknown device ${device}`);
                 if (!rec.configs.has(device) && rec.configs.size >= MAX_DEVICES_PER_SOURCE) throw new Error(`${source}: too many devices`);
-                return this.config(rec, source, device, validateEntities(msg.entities));
+                // an entity this bridge cannot take (a newer add-on's) is dropped alone, the others are kept
+                return this.config(rec, source, device, validateEntities(msg.entities,
+                    reason => this.dropped(owner, `${source}/${device}: entity dropped: ${reason}`)));
             case 'withdraw': return this.withdraw(rec, source, device);
             case 'state': return this.state(rec, source, device, msg.key, msg.value);
             case 'event': return this.event(rec, source, device, msg.key, msg.event_type, msg.attributes);
+            case 'image': return this.image(rec, source, device, msg.key, msg.jpeg);
             default: throw new Error(`${source}: unknown type ${JSON.stringify(msg.type)}`);
         }
     }
@@ -106,13 +129,24 @@ export class AddonRelay {
             states!.delete(k);
             if (published) this.sink.state(device, source, k, '');
         }
+        for (const k of this.imageKeys(rec, device)) {
+            if (keys.has(k)) continue;
+            this.keepImage(rec, device, k, undefined);
+            if (published) this.sink.image(device, source, k, Buffer.alloc(0));
+        }
     }
 
     private withdraw(rec: SourceRecord, source: string, device: string) {
         if (!rec.configs.has(device)) return;
         rec.configs.delete(device);
         rec.states.delete(device);
-        if (this.isPublished(device)) this.sink.config(device, source, undefined);
+        const published = this.isPublished(device);
+        // images are large: cleared from the broker at once, not left retained until a later run finds them stale
+        for (const k of this.imageKeys(rec, device)) {
+            this.keepImage(rec, device, k, undefined);
+            if (published) this.sink.image(device, source, k, Buffer.alloc(0));
+        }
+        if (published) this.sink.config(device, source, undefined);
     }
 
     private entity(rec: SourceRecord, source: string, device: string, key: unknown): EntitySpec {
@@ -123,7 +157,7 @@ export class AddonRelay {
 
     private state(rec: SourceRecord, source: string, device: string, key: unknown, value: unknown) {
         const e = this.entity(rec, source, device, key);
-        if (e.platform === 'button' || e.platform === 'event') throw new Error(`${source}/${device}/${e.key}: ${e.platform} has no state`);
+        if (e.platform === 'button' || e.platform === 'event' || e.platform === 'image') throw new Error(`${source}/${device}/${e.key}: ${e.platform} has no state`);
         const payload = encodeState(value);
         let states = rec.states.get(device);
         if (!states) rec.states.set(device, states = new Map());
@@ -140,6 +174,50 @@ export class AddonRelay {
         const payload = JSON.stringify({ event_type: type, attributes: attrs });
         if (payload.length > MAX_ATTRIBUTES_BYTES) throw new Error(`${source}/${device}/${e.key}: attributes too large`);
         if (this.isPublished(device)) this.sink.event(device, source, e.key, payload);
+    }
+
+    private image(rec: SourceRecord, source: string, device: string, key: unknown, jpeg: unknown) {
+        const e = this.entity(rec, source, device, key);
+        if (e.platform !== 'image') throw new Error(`${source}/${device}/${e.key}: not an image`);
+        let payload: Buffer;
+        try { payload = decodeImage(jpeg); }
+        catch (err) { throw new Error(`${source}/${device}/${e.key}: ${(err as Error).message}`); }
+        // a clear is always passed on: an image published over budget was not kept, yet is retained on the broker
+        if (rec.images.get(device)?.get(e.key)?.equals(payload)) return;
+        if (!this.keepImage(rec, device, e.key, payload.length ? payload : undefined))
+            this.log(`${source}/${device}/${e.key}: image published but not kept (more than ${MAX_KEPT_IMAGE_BYTES >> 20} MB of images)`);
+        if (this.isPublished(device)) this.sink.image(device, source, e.key, payload);
+    }
+
+    /** Keys of the device's images on the broker, kept or not. */
+    private imageKeys(rec: SourceRecord, device: string): string[] {
+        return [...new Set([...rec.images.get(device)?.keys() ?? [], ...rec.unkept.get(device) ?? []])];
+    }
+
+    /**
+     * Remembers (or forgets, when undefined) a device's image within MAX_KEPT_IMAGE_BYTES; false when it was over budget,
+     * and then only its key is remembered.
+     */
+    private keepImage(rec: SourceRecord, device: string, key: string, jpeg: Buffer | undefined): boolean {
+        let images = rec.images.get(device);
+        const before = images?.get(key);
+        if (before) {
+            this.imageBytes -= before.length;
+            images!.delete(key);
+            if (!images!.size) rec.images.delete(device);
+        }
+        const unkept = rec.unkept.get(device);
+        if (unkept?.delete(key) && !unkept.size) rec.unkept.delete(device);
+        if (!jpeg) return true;
+        if (this.imageBytes + jpeg.length > MAX_KEPT_IMAGE_BYTES) {
+            if (!rec.unkept.has(device)) rec.unkept.set(device, new Set());
+            rec.unkept.get(device)!.add(key);
+            return false;
+        }
+        if (!images || !rec.images.has(device)) rec.images.set(device, images = new Map());
+        images.set(key, jpeg);
+        this.imageBytes += jpeg.length;
+        return true;
     }
 
     /** Sources silent for SOURCE_TIMEOUT_MS go offline; run every few seconds. */
@@ -160,13 +238,20 @@ export class AddonRelay {
             if (!entities) continue;
             this.sink.config(device, source, entities);
             for (const [k, v] of rec.states.get(device) ?? []) this.sink.state(device, source, k, v);
+            for (const [k, jpeg] of rec.images.get(device) ?? []) this.sink.image(device, source, k, jpeg);
         }
     }
 
-    /** A camera is no longer published: withdraw the add-ons' configs (kept in memory for later). */
+    /**
+     * A camera is no longer published: clear the add-ons' images and withdraw their configs (both kept in memory for
+     * later, but for images that were not kept: those are gone from the broker now).
+     */
     deviceUnpublished(device: string) {
-        for (const [source, rec] of this.sources)
+        for (const [source, rec] of this.sources) {
+            for (const k of this.imageKeys(rec, device)) this.sink.image(device, source, k, Buffer.alloc(0));
+            rec.unkept.delete(device);
             if (rec.configs.has(device)) this.sink.config(device, source, undefined);
+        }
     }
 
     /** After a broker (re)connection: statuses, then every published device's configs and states. */

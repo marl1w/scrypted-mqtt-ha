@@ -10,6 +10,7 @@ from custom_components.scrypted_mqtt.contract import (
     is_valid_root,
     parse_config,
     parse_event,
+    parse_image,
     parse_state,
     parse_topic,
 )
@@ -88,3 +89,23 @@ def test_events_states_and_roots() -> None:
     assert is_valid_root("home/scrypted")
     assert not is_valid_root("scrypted/#")
     assert not is_valid_root("")
+
+
+def test_images() -> None:
+    jpeg = b"\xff\xd8\xff\xe0" + b"\x00" * 16
+    assert parse_topic("scrypted", "scrypted/devices/42/guard/image/last_detection") == Topic("image", source="guard", device="42", key="last_detection")
+    assert parse_topic("scrypted", "scrypted/devices/42/guard/image/Bad") is None
+    assert parse_image(jpeg) == jpeg
+    assert parse_image(b"") is None
+    with pytest.raises(ContractError):
+        parse_image(b"\x89PNG\r\n")
+    with pytest.raises(ContractError):
+        parse_image(b"\xff\xd8\xff" + b"\x00" * (1024 * 1024))
+    assert parse_config(json.dumps({"v": 1, "entities": [{"key": "shot", "name": "Shot", "platform": "image"}]}).encode(), "guard").entities[0].platform == "image"
+
+
+def test_camera_is_not_a_source_name() -> None:
+    # <root>:<device>:camera:<key> is the unique id of an extra camera
+    assert parse_topic("scrypted", "scrypted/devices/42/camera/config") is None
+    assert parse_topic("scrypted", "scrypted/devices/42/camera/state/high") is None
+    assert parse_topic("scrypted", "scrypted/sources/camera/status") is None

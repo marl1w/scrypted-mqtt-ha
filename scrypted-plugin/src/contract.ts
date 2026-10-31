@@ -10,11 +10,16 @@ export const ADDON_EVENT = 'ScryptedMqttAddon';
 /** Scrypted event interface the bridge emits on its own plugin device. */
 export const BRIDGE_EVENT = 'ScryptedMqttBridge';
 
-export const PLATFORMS = ['binary_sensor', 'sensor', 'switch', 'button', 'event'] as const;
+export const PLATFORMS = ['binary_sensor', 'sensor', 'switch', 'button', 'event', 'image'] as const;
 export type Platform = typeof PLATFORMS[number];
 
 export const MAX_ENTITIES = 64;
 const MAX_TEXT = 255;
+/** Largest JPEG on an `image/<key>` topic. */
+export const MAX_IMAGE_BYTES = 1024 * 1024;
+/** Base64 length of MAX_IMAGE_BYTES: anything longer is refused before it is decoded. */
+const MAX_IMAGE_BASE64 = Math.ceil(MAX_IMAGE_BYTES / 3) * 4;
+const BASE64_RE = /^[A-Za-z0-9+/]*={0,2}$/;
 
 const DEVICE_RE = /^[0-9A-Za-z_-]{1,64}$/;
 const SOURCE_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
@@ -25,11 +30,13 @@ const REQUEST_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const ROOT_RE = /^[A-Za-z0-9_-]+(\/[A-Za-z0-9_-]+)*$/;
 const DEVICE_CLASS_RE = /^[a-z_]{1,32}$/;
 const ICON_RE = /^mdi:[a-z0-9-]{1,64}$/;
+/** Not a source name: the extra cameras' unique ids in Home Assistant, `<root>:<device>:camera:<key>`, would collide with its entities'. */
+const RESERVED_SOURCES = ['camera'];
 const STATE_CLASSES = ['measurement', 'total', 'total_increasing'];
 const CATEGORIES = ['diagnostic', 'config'];
 
 export const isDevice = (s: unknown): s is string => typeof s === 'string' && DEVICE_RE.test(s);
-export const isSource = (s: unknown): s is string => typeof s === 'string' && SOURCE_RE.test(s);
+export const isSource = (s: unknown): s is string => typeof s === 'string' && SOURCE_RE.test(s) && !RESERVED_SOURCES.includes(s);
 export const isKey = (s: unknown): s is string => typeof s === 'string' && KEY_RE.test(s);
 export const isEventType = (s: unknown): s is string => typeof s === 'string' && EVENT_TYPE_RE.test(s);
 export const isRequestId = (s: unknown): s is string => typeof s === 'string' && REQUEST_RE.test(s);
@@ -130,17 +137,50 @@ export function validateEntity(raw: any): EntitySpec {
     return e;
 }
 
-/** A source's entity list: every entity valid, keys unique, at most MAX_ENTITIES. */
-export function validateEntities(raw: unknown): EntitySpec[] {
+/**
+ * A source's entity list: keys unique, at most MAX_ENTITIES. An invalid entity throws, or with `dropped` is left out
+ * and reported there (as Home Assistant does, so a newer add-on's entity this bridge does not know costs only itself).
+ */
+export function validateEntities(raw: unknown, dropped?: (reason: string) => void): EntitySpec[] {
     if (!Array.isArray(raw)) throw new Error('entities is not a list');
     if (raw.length > MAX_ENTITIES) throw new Error(`more than ${MAX_ENTITIES} entities`);
-    const out = raw.map(validateEntity);
+    const out: EntitySpec[] = [];
+    for (const r of raw) {
+        try { out.push(validateEntity(r)); }
+        catch (e) {
+            if (!dropped) throw e;
+            dropped((e as Error).message);
+        }
+    }
     const keys = new Set<string>();
     for (const e of out) {
         if (keys.has(e.key)) throw new Error(`duplicate key ${e.key}`);
         keys.add(e.key);
     }
     return out;
+}
+
+/**
+ * The bridge's `hello` to add-ons: resend everything. `platforms` lists the entity platforms this bridge accepts; an
+ * add-on declares only entities on those (a bridge before 0.1.2 sends none: every platform but `image`).
+ */
+export function helloMessage() {
+    return { v: CONTRACT_VERSION, type: 'hello' as const, platforms: [...PLATFORMS] as string[] };
+}
+
+/** True for a JPEG the contract accepts on an image topic: at most MAX_IMAGE_BYTES, starting with the SOI marker. */
+export function isJpeg(b: Uint8Array): boolean {
+    return b.length >= 3 && b.length <= MAX_IMAGE_BYTES && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff;
+}
+
+/** An add-on's `jpeg` field: base64 of a JPEG, or null / empty for no image (an empty payload). Throws when invalid. */
+export function decodeImage(value: unknown): Buffer {
+    if (value === null || value === undefined || value === '') return Buffer.alloc(0);
+    if (typeof value !== 'string' || value.length > MAX_IMAGE_BASE64 || value.length % 4 !== 0 || !BASE64_RE.test(value))
+        throw new Error('image is not base64 of at most 1 MB');
+    const jpeg = Buffer.from(value, 'base64');
+    if (!isJpeg(jpeg)) throw new Error('image is not a JPEG of at most 1 MB');
+    return jpeg;
 }
 
 /** A state payload: booleans as ON/OFF, null/undefined as unknown (empty), text up to 255 characters. */
@@ -161,6 +201,7 @@ export class Topics {
     config(device: string, source: string) { return `${this.root}/devices/${device}/${source}/config`; }
     state(device: string, source: string, key: string) { return `${this.root}/devices/${device}/${source}/state/${key}`; }
     event(device: string, source: string, key: string) { return `${this.root}/devices/${device}/${source}/event/${key}`; }
+    image(device: string, source: string, key: string) { return `${this.root}/devices/${device}/${source}/image/${key}`; }
     snapshotReply(device: string, id: string) { return `${this.root}/devices/${device}/${BRIDGE_SOURCE}/snapshot/${id}`; }
     /** what the bridge subscribes to */
     get commands() { return `${this.root}/devices/+/+/set/+`; }

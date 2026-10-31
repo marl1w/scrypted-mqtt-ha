@@ -7,10 +7,10 @@ import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from pytest_homeassistant_custom_component.common import MockConfigEntry, async_fire_mqtt_message
+from pytest_homeassistant_custom_component.common import MockConfigEntry, async_fire_mqtt_message, mock_restore_cache_with_extra_data
 
 from homeassistant.const import STATE_OFF, STATE_ON, STATE_UNAVAILABLE, STATE_UNKNOWN
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, State
 from homeassistant.helpers import device_registry as dr, entity_registry as er
 
 from custom_components.scrypted_mqtt.const import DOMAIN
@@ -244,3 +244,170 @@ async def test_extra_streams_are_cameras_of_their_own(hass: HomeAssistant, setup
     fire(hass, "devices/42/bridge/config", bridge_config())
     await hass.async_block_till_done()
     assert er.async_get(hass).async_get("camera.front_door_high_resolution") is None
+
+
+SHOT = json.dumps(
+    {
+        "v": 1,
+        "entities": [
+            {"key": "last_detection", "name": "Last detection", "platform": "image", "object_id": "front_door_last_detection"},
+        ],
+    }
+)
+JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 64 + b"\xff\xd9"
+
+
+async def test_image_shows_the_last_jpeg_and_when_it_arrived(hass: HomeAssistant, setup) -> None:
+    await publish_camera(hass)
+    fire(hass, "devices/42/guard/config", SHOT)
+    await hass.async_block_till_done()
+    image = hass.data["image"].get_entity("image.front_door_last_detection")
+    assert hass.states.get("image.front_door_last_detection").state == STATE_UNKNOWN
+    assert await image.async_image() is None
+    fire(hass, "devices/42/guard/image/last_detection", JPEG, retain=True)
+    await hass.async_block_till_done()
+    first = hass.states.get("image.front_door_last_detection").state
+    assert first not in (STATE_UNKNOWN, STATE_UNAVAILABLE)
+    assert await image.async_image() == JPEG
+    assert image.content_type == "image/jpeg"
+    # the same picture again (a bridge restart resends it) is not a new detection
+    fire(hass, "devices/42/guard/image/last_detection", JPEG, retain=True)
+    await hass.async_block_till_done()
+    assert hass.states.get("image.front_door_last_detection").state == first
+    # not a JPEG, or over 1 MB: dropped, the last picture stays
+    fire(hass, "devices/42/guard/image/last_detection", b"GIF89a....")
+    fire(hass, "devices/42/guard/image/last_detection", b"\xff\xd8\xff" + b"\x00" * (1024 * 1024))
+    await hass.async_block_till_done()
+    assert await image.async_image() == JPEG
+    fire(hass, "devices/42/guard/image/last_detection", b"")
+    await hass.async_block_till_done()
+    assert hass.states.get("image.front_door_last_detection").state == STATE_UNKNOWN
+    assert await image.async_image() is None
+
+
+async def test_image_arrived_before_its_entity_and_follows_source_status(hass: HomeAssistant, setup) -> None:
+    fire(hass, "devices/42/guard/image/last_detection", JPEG, retain=True)
+    fire(hass, "devices/42/guard/config", SHOT, retain=True)
+    await publish_camera(hass)
+    image = hass.data["image"].get_entity("image.front_door_last_detection")
+    assert await image.async_image() == JPEG
+    assert hass.states.get("image.front_door_last_detection").state != STATE_UNKNOWN
+    fire(hass, "sources/guard/status", "offline")
+    await hass.async_block_till_done()
+    assert hass.states.get("image.front_door_last_detection").state == STATE_UNAVAILABLE
+
+
+async def test_image_keeps_its_time_across_a_restart_only_for_the_same_picture(hass: HomeAssistant, mqtt_mock) -> None:
+    import hashlib
+
+    before = "2026-10-01T08:00:00+00:00"
+    mock_restore_cache_with_extra_data(
+        hass,
+        [(State("image.front_door_last_detection", before), {"digest": hashlib.sha256(JPEG).hexdigest(), "updated": before})],
+    )
+    entry = MockConfigEntry(domain=DOMAIN, data={"root": ROOT}, title="Scrypted MQTT")
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    fire(hass, "devices/42/guard/image/last_detection", JPEG, retain=True)
+    fire(hass, "devices/42/guard/config", SHOT, retain=True)
+    await publish_camera(hass)
+    assert hass.states.get("image.front_door_last_detection").state == before
+    fire(hass, "devices/42/guard/image/last_detection", JPEG[:-2] + b"\x01\xff\xd9")
+    await hass.async_block_till_done()
+    assert hass.states.get("image.front_door_last_detection").state > before
+    await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+def shots(*keys: str, platform: str = "image") -> str:
+    return json.dumps({"v": 1, "entities": [{"key": k, "name": k, "platform": platform} for k in keys]})
+
+
+async def test_only_declared_images_are_kept(hass: HomeAssistant, setup) -> None:
+    hub = setup.runtime_data
+    await publish_camera(hass)
+    fire(hass, "devices/42/guard/config", GUARD)
+    # undeclared, or declared as something else: not stored
+    fire(hass, "devices/42/guard/image/person", JPEG, retain=True)
+    fire(hass, "devices/42/guard/image/nothing", JPEG, retain=True)
+    await hass.async_block_till_done()
+    assert hub.image("42", "guard", "person") is None
+    assert hub.image("42", "guard", "nothing") is None
+    # held for a while in case its config is on the way: taken once it arrives
+    fire(hass, "devices/42/guard/config", shots("nothing"))
+    await hass.async_block_till_done()
+    assert hub.image("42", "guard", "nothing").content == JPEG
+    # dropped once no config declares it
+    fire(hass, "devices/42/guard/config", shots("nothing", platform="sensor"))
+    await hass.async_block_till_done()
+    assert hub.image("42", "guard", "nothing") is None
+    fire(hass, "devices/42/guard/config", shots("nothing"))
+    await hass.async_block_till_done()
+    assert hub.image("42", "guard", "nothing") is None
+
+
+async def test_pending_images_are_bounded_oldest_first(hass: HomeAssistant, setup) -> None:
+    hub = setup.runtime_data
+    await publish_camera(hass)
+    keys = [f"shot_{i}" for i in range(40)]
+    for key in keys:
+        fire(hass, f"devices/42/guard/image/{key}", JPEG, retain=True)
+    fire(hass, "devices/42/guard/config", shots(*keys))
+    await hass.async_block_till_done()
+    assert [k for k in keys if hub.image("42", "guard", k)] == keys[8:]
+
+
+async def test_images_are_bounded_in_count_and_charged_at_least_4_kb(hass: HomeAssistant, setup) -> None:
+    hub = setup.runtime_data
+    await publish_camera(hass)
+    fire(hass, "devices/42/guard/config", shots("a", "b", "c"))
+    await hass.async_block_till_done()
+    with patch("custom_components.scrypted_mqtt.hub.MAX_IMAGE_BYTES_TOTAL", 2 * 4096):
+        for key in ("a", "b", "c"):
+            fire(hass, f"devices/42/guard/image/{key}", JPEG)
+        await hass.async_block_till_done()
+    assert [k for k in ("a", "b", "c") if hub.image("42", "guard", k)] == ["a", "b"]
+    fire(hass, "devices/42/guard/image/a", b"")
+    with patch("custom_components.scrypted_mqtt.hub.MAX_IMAGES", 2):
+        fire(hass, "devices/42/guard/image/a", JPEG)
+        fire(hass, "devices/42/guard/image/c", JPEG)
+        await hass.async_block_till_done()
+    assert [k for k in ("a", "b", "c") if hub.image("42", "guard", k)] == ["a", "b"]
+
+
+async def test_image_shows_its_restored_time_until_the_picture_arrives_or_is_cleared(hass: HomeAssistant, mqtt_mock) -> None:
+    import hashlib
+
+    before = "2026-10-01T08:00:00+00:00"
+    mock_restore_cache_with_extra_data(
+        hass,
+        [(State("image.front_door_last_detection", before), {"digest": hashlib.sha256(JPEG).hexdigest(), "updated": before})],
+    )
+    entry = MockConfigEntry(domain=DOMAIN, data={"root": ROOT}, title="Scrypted MQTT")
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    fire(hass, "devices/42/guard/config", SHOT, retain=True)
+    await publish_camera(hass)
+    image = hass.data["image"].get_entity("image.front_door_last_detection")
+    # no picture yet: not unknown, and the record survives another restart
+    assert hass.states.get("image.front_door_last_detection").state == before
+    assert image.extra_restore_state_data.as_dict()["updated"] == before
+    fire(hass, "sources/guard/status", "online")
+    await hass.async_block_till_done()
+    assert hass.states.get("image.front_door_last_detection").state == before
+    # the same picture keeps its time
+    fire(hass, "devices/42/guard/image/last_detection", JPEG, retain=True)
+    await hass.async_block_till_done()
+    assert hass.states.get("image.front_door_last_detection").state == before
+    # cleared: unknown, and the same picture again later is new
+    fire(hass, "devices/42/guard/image/last_detection", b"")
+    await hass.async_block_till_done()
+    assert hass.states.get("image.front_door_last_detection").state == STATE_UNKNOWN
+    assert image.extra_restore_state_data is None
+    fire(hass, "devices/42/guard/image/last_detection", JPEG)
+    await hass.async_block_till_done()
+    assert hass.states.get("image.front_door_last_detection").state > before
+    await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()

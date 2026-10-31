@@ -13,7 +13,7 @@ One Home Assistant device per Scrypted camera, with everything Scrypted knows ab
 - **Camera**: live view from Scrypted's rebroadcast (WebRTC through Home Assistant's go2rtc), snapshots taken by Scrypted.
 - **Sensors** from the camera's Scrypted interfaces: online, motion, occupancy, battery, and an **Object detected** event per detection class.
 - **Child devices** of the camera (siren, floodlight, extra sensors) as switches and binary sensors on the same device.
-- **Add-ons**: any Scrypted plugin can add entities to a camera (contract section 10). States are exact: on and off as the plugin reports them, with no timers.
+- **Add-ons**: any Scrypted plugin can add entities to a camera (contract section 10), pictures included (an image entity, such as the last verified detection). States are exact: on and off as the plugin reports them, with no timers.
 
 ## Install
 
@@ -23,6 +23,17 @@ Requirements: Home Assistant 2026.1 or newer with the MQTT integration set up, a
 2. **Home Assistant**: HACS → **⋮** → **Custom repositories** → add this repository as an **Integration**, install **Scrypted MQTT**, restart, then **Settings → Devices & services → Add integration → Scrypted MQTT**. The only setting is the topic root (default `scrypted`).
 
 **Stream host** in the plugin is the address Home Assistant uses to reach Scrypted's rebroadcast. Keep `127.0.0.1` when Scrypted runs as a Home Assistant add-on or otherwise shares the host network.
+
+**High resolution**: a camera whose highest-resolution stream is not its default one gets a second camera entity, **High resolution**, enabled like the main one. Leave that stream unprebuffered in Rebroadcast: Scrypted then opens a main-stream session to the camera only while someone watches it, and the default camera keeps serving dashboards and snapshots.
+
+**Recorder**: an add-on's pictures (such as the last detection) change their entity's state each time. To keep them out of the history database:
+
+```yaml
+recorder:
+  exclude:
+    entity_globs:
+      - image.*_last_detection
+```
 
 ## Security
 

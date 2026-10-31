@@ -1,5 +1,6 @@
 import sdk, { Battery, BinarySensor, Camera, EventListenerRegister, ResponseMediaStreamOptions, MotionSensor, ObjectDetector, ObjectsDetected, OccupancySensor, OnOff, Online, ScryptedDevice, ScryptedInterface, Settings, VideoCamera } from '@scrypted/sdk';
 import { ConfigPayload, CONTRACT_VERSION, DeviceSpec, encodeState, EntitySpec, eventType, SnapshotRequest, StreamSpec, streamUrlFor } from './contract';
+import { StreamUrlKeeper, StreamUrls } from './stream';
 
 type Dev = ScryptedDevice & Partial<VideoCamera & Camera & MotionSensor & OccupancySensor & Online & Battery & ObjectDetector & OnOff & BinarySensor & Settings>;
 
@@ -18,8 +19,6 @@ const SNAPSHOT_TIMEOUT_MS = 8000;
 const SNAPSHOT_REUSE_MS = 3000;
 /** One event per class per camera at most this often: detectors repeat every second while a class is seen. */
 const DETECTION_EVENT_MS = 5000;
-/** The rebroadcast URL is looked up again after this long even when the stream options did not change. */
-const STREAM_URL_TTL_MS = 60 * 60_000;
 const LOOKUP_TIMEOUT_MS = 15000;
 const CHILD_PREFIX = 'child_';
 
@@ -57,7 +56,7 @@ function childState(child: Dev): boolean | undefined {
  * The RTSP rebroadcasts Home Assistant plays, as it reaches them: Rebroadcast's default stream (a cropped view where one
  * is configured, else a prebuffered one), and the highest-resolution stream when that is another one.
  */
-async function rebroadcastUrls(d: Dev, options: ResponseMediaStreamOptions[], host: string, audio: boolean): Promise<{ main?: string; high?: string }> {
+async function rebroadcastUrls(d: Dev, options: ResponseMediaStreamOptions[], host: string, audio: boolean): Promise<StreamUrls> {
     if (!options.length || !d.interfaces?.includes(ScryptedInterface.Settings)) return {};
     const settings = await withTimeout(d.getSettings!(), LOOKUP_TIMEOUT_MS, 'settings');
     const key = audio ? 'prebuffer:rtspRebroadcastUrl' : 'prebuffer:rtspRebroadcastMutedUrl';
@@ -86,7 +85,8 @@ export class CameraPublisher {
     private snapshot?: Promise<Buffer | undefined>;
     private lastPicture?: { at: number; jpeg: Buffer };
     private lastEvent = new Map<string, number>();
-    private stream?: { key: string; urls: { main?: string; high?: string }; at: number };
+    private stream = new StreamUrlKeeper();
+    private streamRetry?: NodeJS.Timeout;
     private running?: Promise<boolean>;
     private dirty = false;
     private stopped = false;
@@ -180,23 +180,34 @@ export class CameraPublisher {
         return true;
     }
 
-    /** The rebroadcast URLs, looked up through every mixin's settings only when the stream options changed or they are old. */
-    private async streamUrls(d: Dev): Promise<{ main?: string; high?: string }> {
+    /**
+     * The rebroadcast URLs, looked up through every mixin's settings only when the stream options changed or they are old.
+     * A lookup that fails or loses a URL keeps the last good ones and is retried soon (StreamUrlKeeper).
+     */
+    private async streamUrls(d: Dev): Promise<StreamUrls> {
+        let key = '';
+        let urls: StreamUrls | undefined;
         try {
             const options = d.interfaces?.includes(ScryptedInterface.VideoCamera)
                 ? await withTimeout(d.getVideoStreamOptions!(), LOOKUP_TIMEOUT_MS, 'stream options')
                 : [];
             const audio = this.host.streamAudio();
-            const key = JSON.stringify([this.host.streamHost(), audio, options.map(o => [o.id, o.name, !!o.prebuffer])]);
-            if (this.stream?.key === key && this.stream.urls.main && Date.now() - this.stream.at < STREAM_URL_TTL_MS) return this.stream.urls;
-            const urls = await rebroadcastUrls(d, options, this.host.streamHost(), audio);
-            this.stream = { key, urls, at: Date.now() };
-            return urls;
+            key = JSON.stringify([this.host.streamHost(), audio, options.map(o => [o.id, o.name, !!o.prebuffer])]);
+            const cached = this.stream.cached(key);
+            if (cached) return cached;
+            urls = await rebroadcastUrls(d, options, this.host.streamHost(), audio);
         }
         catch (e) {
             this.host.console.warn(`${d.name}: no stream URL (${(e as Error).message})`);
-            return this.stream?.urls ?? {};
         }
+        const next = this.stream.update(key, urls);
+        if (next.retryMs !== undefined && !this.streamRetry && !this.stopped) {
+            this.streamRetry = setTimeout(() => {
+                this.streamRetry = undefined;
+                this.refresh().catch(e => this.host.console.warn(`${d.name}: ${(e as Error).message}`));
+            }, next.retryMs);
+        }
+        return next.urls;
     }
 
     private bind(d: Dev, children: Dev[], watched: string) {
@@ -322,6 +333,7 @@ export class CameraPublisher {
     }
 
     stop(withdraw: boolean) {
+        clearTimeout(this.streamRetry);
         if (withdraw) this.withdraw();
         else this.unbind();
         this.stopped = true;

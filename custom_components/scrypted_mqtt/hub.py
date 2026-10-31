@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from datetime import datetime
+import hashlib
 import json
 import logging
 import secrets
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from homeassistant.components import mqtt
 from homeassistant.config_entries import ConfigEntry
@@ -16,6 +18,7 @@ from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.entity import Entity
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_call_later
+from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN, SNAPSHOT_TIMEOUT, STALE_GRACE
 from .contract import (
@@ -26,6 +29,7 @@ from .contract import (
     EntitySpec,
     parse_config,
     parse_event,
+    parse_image,
     parse_state,
     parse_topic,
 )
@@ -44,6 +48,12 @@ MAX_EVENT_BYTES = 4096
 MAX_SNAPSHOT_BYTES = 10 * 1024 * 1024
 # Bounds on what a publisher on the broker can make the hub remember.
 MAX_STATES = 20000
+MAX_IMAGE_BYTES_TOTAL = 64 * 1024 * 1024
+MAX_IMAGES = 1024
+# Every image is charged at least this much against MAX_IMAGE_BYTES_TOTAL, so tiny ones cannot add up unbounded.
+MIN_IMAGE_COST = 4096
+# Images that arrived before a config declaring them (retained topics come in any order); the oldest goes first.
+MAX_PENDING_IMAGES = 32
 MAX_DEVICES = 512
 MAX_SOURCES_PER_DEVICE = 16
 MAX_WARNINGS = 256
@@ -51,6 +61,18 @@ MAX_WARNINGS = 256
 SNAPSHOT_WIDTHS = (320, 640, 1280, 1920)
 
 type EntityFactory = Callable[["ScryptedMqttHub", str, str, EntitySpec | None], Entity]
+
+
+class StoredImage(NamedTuple):
+    """An image as received: its bytes, their SHA-256 and when it arrived."""
+
+    content: bytes
+    digest: str
+    received: datetime
+
+
+def _image_cost(content: bytes) -> int:
+    return max(len(content), MIN_IMAGE_COST)
 
 
 class ScryptedMqttHub:
@@ -64,6 +86,9 @@ class ScryptedMqttHub:
         self._bridge: dict[str, Config] = {}
         self._sources: dict[str, dict[str, Config]] = {}
         self._states: dict[tuple[str, str, str], str | None] = {}
+        self._images: dict[tuple[str, str, str], StoredImage] = {}
+        self._image_bytes = 0
+        self._pending_images: dict[tuple[str, str, str], bytes] = {}
         self._status: dict[str, bool] = {}
         # unique id -> (platform, device, source, spec) of every entity handed to a platform
         self._created: dict[str, tuple[str, str, str, EntitySpec | None]] = {}
@@ -167,6 +192,10 @@ class ScryptedMqttHub:
         """Return the last state of an entity, None when unknown."""
         return self._states.get((device, source, key))
 
+    def image(self, device: str, source: str, key: str) -> StoredImage | None:
+        """Return the last image of an entity, None when there is none."""
+        return self._images.get((device, source, key))
+
     def device_spec(self, device: str) -> DeviceSpec | None:
         """Return the bridge's description of a device."""
         cfg = self._bridge.get(device)
@@ -189,6 +218,8 @@ class ScryptedMqttHub:
                 self._on_state(topic.device, topic.source, topic.key, payload)
             elif topic.kind == "event":
                 self._on_event(topic.device, topic.source, topic.key, payload)
+            elif topic.kind == "image":
+                self._on_image(topic.device, topic.source, topic.key, payload)
             elif topic.kind == "snapshot":
                 pending = self._snapshots.get(topic.key)
                 if pending and pending[0] == topic.device and not pending[1].done():
@@ -264,6 +295,61 @@ class ScryptedMqttHub:
         event_type, attributes = parse_event(payload)
         entity.fire(event_type, attributes)
 
+    def _declares_image(self, device: str, source: str, key: str) -> bool:
+        config = self._bridge.get(device) if source == BRIDGE_SOURCE else self._sources.get(device, {}).get(source)
+        return config is not None and any(e.key == key and e.platform == "image" for e in config.entities)
+
+    @callback
+    def _on_image(self, device: str, source: str, key: str, payload: bytes) -> None:
+        image_key = (device, source, key)
+        jpeg = parse_image(payload)
+        if self._declares_image(device, source, key):
+            self._store_image(image_key, jpeg)
+            return
+        # only declared images are kept; one may arrive just before its config, so a few wait for it
+        self._pending_images.pop(image_key, None)
+        if jpeg is not None:
+            self._pending_images[image_key] = jpeg
+            while len(self._pending_images) > MAX_PENDING_IMAGES:
+                del self._pending_images[next(iter(self._pending_images))]
+
+    @callback
+    def _store_image(self, image_key: tuple[str, str, str], jpeg: bytes | None) -> None:
+        before = self._images.get(image_key)
+        if jpeg is not None:
+            if before is not None and before.content == jpeg:
+                return
+            if before is None and len(self._images) >= MAX_IMAGES:
+                raise ContractError(f"more than {MAX_IMAGES} images")
+            if self._image_bytes - (_image_cost(before.content) if before else 0) + _image_cost(jpeg) > MAX_IMAGE_BYTES_TOTAL:
+                raise ContractError("more than 64 MB of images")
+        self._forget_image(image_key)
+        if jpeg is not None:
+            self._images[image_key] = StoredImage(jpeg, hashlib.sha256(jpeg).hexdigest(), dt_util.utcnow())
+            self._image_bytes += _image_cost(jpeg)
+        if entity := self._entities.get(self.unique_id(*image_key)):
+            if jpeg is None and hasattr(entity, "clear_image"):
+                entity.clear_image()
+            else:
+                entity.handle_update()
+
+    @callback
+    def _forget_image(self, image_key: tuple[str, str, str]) -> None:
+        if (before := self._images.pop(image_key, None)) is not None:
+            self._image_bytes -= _image_cost(before.content)
+
+    @callback
+    def _reconcile_images(self, device: str) -> None:
+        """Drop the device's images no config declares any more, and take those that arrived before their config."""
+        for image_key in [k for k in self._images if k[0] == device and not self._declares_image(*k)]:
+            self._forget_image(image_key)
+        for image_key in [k for k in self._pending_images if k[0] == device and self._declares_image(*k)]:
+            jpeg = self._pending_images.pop(image_key)
+            try:
+                self._store_image(image_key, jpeg)
+            except ContractError as err:
+                self._warn_once("/".join(image_key), f"{'/'.join(image_key)}: {err}")
+
     # ---- devices and entities --------------------------------------------------------------
 
     @callback
@@ -305,7 +391,8 @@ class ScryptedMqttHub:
 
     @callback
     def _reconcile(self, device: str) -> None:
-        """Make the device's entities match what its sources declare."""
+        """Make the device's entities (and images) match what its sources declare."""
+        self._reconcile_images(device)
         desired = self._desired(device)
         current = {uid: v for uid, v in self._created.items() if v[1] == device}
         for uid, (platform, _, _, _) in current.items():
@@ -352,6 +439,10 @@ class ScryptedMqttHub:
 
     @callback
     def _remove_device(self, device: str) -> None:
+        for image_key in [k for k in self._images if k[0] == device]:
+            self._forget_image(image_key)
+        for image_key in [k for k in self._pending_images if k[0] == device]:
+            del self._pending_images[image_key]
         for uid, (platform, dev, _, _) in list(self._created.items()):
             if dev == device:
                 self._remove_entity(uid, platform)

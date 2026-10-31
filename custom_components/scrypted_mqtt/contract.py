@@ -10,12 +10,16 @@ from urllib.parse import urlsplit
 
 CONTRACT_VERSION = 1
 BRIDGE_SOURCE = "bridge"
-PLATFORMS = ("binary_sensor", "sensor", "switch", "button", "event")
+PLATFORMS = ("binary_sensor", "sensor", "switch", "button", "event", "image")
 MAX_ENTITIES = 64
 MAX_STATE = 255
+MAX_IMAGE = 1024 * 1024
+_JPEG_MAGIC = b"\xff\xd8\xff"
 
 _DEVICE_RE = re.compile(r"^[0-9A-Za-z_-]{1,64}$")
 _SOURCE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+# Not a source: the extra cameras' unique ids, <root>:<device>:camera:<key>, would collide with its entities'.
+_RESERVED_SOURCES = ("camera",)
 _KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_]{0,63}$")
 _EVENT_TYPE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _OBJECT_ID_RE = re.compile(r"^[a-z0-9_]{1,128}$")
@@ -34,6 +38,11 @@ class ContractError(ValueError):
 def is_valid_root(root: str) -> bool:
     """Return True for a topic root without wildcards or empty levels."""
     return bool(_ROOT_RE.match(root))
+
+
+def is_source(value: str) -> bool:
+    """Return True for a valid source name."""
+    return bool(_SOURCE_RE.match(value)) and value not in _RESERVED_SOURCES
 
 
 def is_event_type(value: Any) -> bool:
@@ -243,11 +252,22 @@ def parse_state(payload: bytes) -> str | None:
         return None
 
 
+def parse_image(payload: bytes) -> bytes | None:
+    """Return the JPEG, None for no image (an empty payload)."""
+    if not payload:
+        return None
+    if len(payload) > MAX_IMAGE:
+        raise ContractError("image larger than 1 MB")
+    if not payload.startswith(_JPEG_MAGIC):
+        raise ContractError("image is not a JPEG")
+    return payload
+
+
 @dataclass(frozen=True)
 class Topic:
     """An inbound topic the integration acts on."""
 
-    kind: str  # status, config, state, event, snapshot
+    kind: str  # status, config, state, event, image, snapshot
     source: str | None = None
     device: str | None = None
     key: str | None = None  # entity key, or the request id of a snapshot
@@ -259,15 +279,15 @@ def parse_topic(root: str, topic: str) -> Topic | None:
         return None
     parts = topic[len(root) + 1 :].split("/")
     if len(parts) == 3 and parts[0] == "sources" and parts[2] == "status":
-        return Topic("status", source=parts[1]) if _SOURCE_RE.match(parts[1]) else None
+        return Topic("status", source=parts[1]) if is_source(parts[1]) else None
     if len(parts) < 4 or parts[0] != "devices":
         return None
     device, source = parts[1], parts[2]
-    if not _DEVICE_RE.match(device) or not _SOURCE_RE.match(source):
+    if not _DEVICE_RE.match(device) or not is_source(source):
         return None
     if len(parts) == 4 and parts[3] == "config":
         return Topic("config", source=source, device=device)
-    if len(parts) == 5 and parts[3] in ("state", "event") and _KEY_RE.match(parts[4]):
+    if len(parts) == 5 and parts[3] in ("state", "event", "image") and _KEY_RE.match(parts[4]):
         return Topic(parts[3], source=source, device=device, key=parts[4])
     if (
         len(parts) == 5

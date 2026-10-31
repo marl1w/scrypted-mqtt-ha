@@ -4,8 +4,8 @@ import mqtt, { IClientOptions, MqttClient } from 'mqtt';
 import packageJson from '../package.json';
 import { AddonRelay } from './addons';
 import { CameraPublisher } from './camera';
-import { ADDON_EVENT, BRIDGE_EVENT, BRIDGE_SOURCE, CONTRACT_VERSION, EntitySpec, isRoot, parseSnapshotRequest, Topics } from './contract';
-import { RetainedLedger } from './retained';
+import { ADDON_EVENT, BRIDGE_EVENT, BRIDGE_SOURCE, CONTRACT_VERSION, EntitySpec, helloMessage, isRoot, parseSnapshotRequest, Topics } from './contract';
+import { RetainedLedger, staleOwned } from './retained';
 
 /** Every camera's config is rebuilt this often (stream URL, children, object types). */
 const REFRESH_MS = 10 * 60_000;
@@ -15,6 +15,8 @@ const DESCRIPTOR_DEBOUNCE_MS = 3000;
 const SETTLE_MS = 120_000;
 /** Add-on listeners are registered over RPC; the bridge says hello once they are surely in place. */
 const HELLO_DELAY_MS = 2000;
+/** Sources first heard within this long of each other share one hello. */
+const HELLO_DEBOUNCE_MS = 1000;
 const SWEEP_MS = 15_000;
 const LEDGER_KEY = 'retainedTopics';
 
@@ -77,6 +79,8 @@ class ScryptedMqttBridge extends ScryptedDeviceBase implements Settings {
     private lastError = '';
     private addonListeners = new Map<string, EventListenerRegister>();
     private refreshTimers = new Map<string, NodeJS.Timeout>();
+    private helloSent = false;
+    private helloTimer?: NodeJS.Timeout;
 
     constructor(nativeId?: string) {
         super(nativeId);
@@ -88,7 +92,9 @@ class ScryptedMqttBridge extends ScryptedDeviceBase implements Settings {
             config: (device, source, entities) => this.publishConfig(device, source, entities),
             state: (device, source, key, payload) => this.send(this.topics?.state(device, source, key), payload, true),
             event: (device, source, key, payload) => this.send(this.topics?.event(device, source, key), payload, false),
+            image: (device, source, key, jpeg) => this.send(this.topics?.image(device, source, key), jpeg, true),
             status: (source, online) => this.send(this.topics?.status(source), online ? 'online' : 'offline', true),
+            sourceAdded: () => this.helloSoon(),
         }, device => this.cameras.has(device), m => this.console.warn(m), Date.now,
             device => !!sdk.systemManager.getSystemState()[device]);
 
@@ -101,11 +107,29 @@ class ScryptedMqttBridge extends ScryptedDeviceBase implements Settings {
         this.timers.push(setInterval(() => this.relay.sweep(), SWEEP_MS));
         this.timers.push(setInterval(() => this.refreshAll(), REFRESH_MS));
         // add-ons resend everything when the bridge starts
-        setTimeout(() => sdk.deviceManager.onDeviceEvent(this.nativeId, BRIDGE_EVENT, { v: CONTRACT_VERSION, type: 'hello' }).catch(() => { }), HELLO_DELAY_MS);
+        setTimeout(() => this.hello(), HELLO_DELAY_MS);
         this.start();
         const shutdown = () => this.stop();
         process.once('SIGTERM', shutdown);
         process.once('beforeExit', shutdown);
+    }
+
+    /** Add-ons resend everything, declaring only entities on the platforms it lists. */
+    private hello() {
+        this.helloSent = true;
+        sdk.deviceManager.onDeviceEvent(this.nativeId, BRIDGE_EVENT, helloMessage()).catch(() => { });
+    }
+
+    /**
+     * A source first heard in this run may have started after the startup hello and so not know the platforms: one more
+     * hello (to every add-on: an event goes to all listeners of the bridge's device; the others' resends are deduplicated).
+     */
+    private helloSoon() {
+        if (!this.helloSent || this.helloTimer) return; // the startup hello is still to come
+        this.helloTimer = setTimeout(() => {
+            this.helloTimer = undefined;
+            this.hello();
+        }, HELLO_DEBOUNCE_MS);
     }
 
     // ---- settings -------------------------------------------------------------------------------
@@ -247,15 +271,14 @@ class ScryptedMqttBridge extends ScryptedDeviceBase implements Settings {
         this.send(this.topics.config(device, source), '', true);
     }
 
-    /** Clears retained topics of earlier runs that this run did not set, for the bridge and for add-ons heard from since it started. */
+    /**
+     * Clears retained topics of earlier runs that this run did not set, for the bridge and for add-ons heard from since it
+     * started, but not an add-on's image its config still declares.
+     */
     private clearStale() {
         if (!this.client?.connected || !this.topics) return;
-        const root = this.topics.root + '/';
-        const stale = this.ledger.takeStale(t => {
-            const p = t.startsWith(root) ? t.slice(root.length).split('/') : [];
-            const source = p[0] === 'sources' ? p[1] : p[0] === 'devices' ? p[2] : undefined;
-            return source === BRIDGE_SOURCE || (!!source && this.relay.hasSource(source));
-        });
+        const root = this.topics.root;
+        const stale = this.ledger.takeStale(t => staleOwned(t, root, this.relay));
         if (stale.length) this.console.log(`clearing ${stale.length} retained topics left by an earlier run`);
         for (const t of stale) this.client.publish(t, '', { qos: 1, retain: true });
         this.persistLedger();
